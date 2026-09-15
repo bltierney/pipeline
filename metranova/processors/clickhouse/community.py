@@ -1,7 +1,11 @@
 import logging
 import os
 import ipaddress
-from metranova.processors.clickhouse.base import BaseMetadataProcessor
+from metranova.processors.clickhouse.base import (
+    BaseMetadataProcessor,
+    BaseClickHouseDictionaryMixin,
+    BaseClickHouseMaterializedViewMixin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +18,8 @@ class CommunityRegistryProcessor(BaseMetadataProcessor):
         self.column_defs.extend([
             ['ip_subnet', 'Array(Tuple(IPv6,UInt8))', True],
             ['organization_name', 'Nullable(String)', True],
+            ['organization_id', 'LowCardinality(Nullable(String))', True],
+            ['organization_ref', 'Nullable(String)', True],
             ['community', 'LowCardinality(Nullable(String))', True],
             ['asn', 'Nullable(UInt32)', True],
             ['notes', 'Nullable(String)', True]
@@ -22,6 +28,18 @@ class CommunityRegistryProcessor(BaseMetadataProcessor):
             ["community_id"],
             ["addresses"]
         ]
+
+        # Same idea as ScienceRegistryProcessor/ASMetadataProcessor: build an
+        # IP_TRIE() dictionary for organization/community lookups by IP. Since
+        # ip_subnet is an Array(Tuple(IPv6,UInt8)) column, a materialized view
+        # first flattens it (one row per prefix) into a plain table that the
+        # dictionary is sourced from. Both are created automatically by
+        # ClickHouseBatcher at startup.
+        self.dictionary_enabled = os.getenv('CLICKHOUSE_COMMUNITY_DICTIONARY_ENABLED', 'true').lower() in ('true', '1', 'yes')
+        if self.dictionary_enabled:
+            prefix_mv = CommunityPrefixMaterializedView(source_table_name=self.table)
+            self.materialized_views.append(prefix_mv)
+            self.ch_dictionaries.append(CommunityDictionary(prefix_mv.table))
 
     def match_message(self, value):
         #override base since don't set table in url
@@ -65,16 +83,32 @@ class CommunityRegistryProcessor(BaseMetadataProcessor):
         #de-identified address more than once)
         ip_subnets = list(dict.fromkeys(ip_subnets))
 
+        org_name = value.get('org_name', None)
+
         #init record
         formatted_record = {
             'ip_subnet': ip_subnets,
-            'organization_name': value.get('org_name', None),
+            'organization_name': org_name,
             'community': value.get('community', None),
             'asn': value.get('asn', None),
             'notes': value.get('notes', None),
             'ext': '{}',
             'tag': []
         }
+
+        # Resolve organization_id/organization_ref via the clickhouse cacher, same
+        # pattern as ASMetadataProcessor and ScienceRegistryProcessor -- keyed by
+        # name (via the cacher's "table:field" composite-key form) since this
+        # source only gives us an org name, not a meta_organization id.
+        # NOTE: this requires 'meta_organization:name' to be listed in the
+        # CLICKHOUSE_CACHER_TABLES env var for this pipeline.
+        cached_org_info = self.pipeline.cacher("clickhouse").lookup("meta_organization:name", org_name)
+        if cached_org_info:
+            formatted_record["organization_id"] = cached_org_info.get("id", org_name)
+            formatted_record["organization_ref"] = cached_org_info.get(self.db_ref_field, None)
+        else:
+            formatted_record["organization_id"] = org_name
+            formatted_record["organization_ref"] = None
 
         #cast asn to an int, and set to None if exception when casting
         if formatted_record['asn'] is not None:
@@ -84,4 +118,61 @@ class CommunityRegistryProcessor(BaseMetadataProcessor):
                 formatted_record['asn'] = None
 
         return formatted_record
+
+
+class CommunityPrefixMaterializedView(BaseClickHouseMaterializedViewMixin):
+    """Flattens meta_ip_community.ip_subnet (one array per community record)
+    into one row per prefix, so it can be used as the SOURCE table for an
+    IP_TRIE() dictionary.
+    """
+
+    def __init__(self, source_table_name: str = "", agg_window: str = ""):
+        super().__init__(source_table_name, agg_window)
+        self.table = os.getenv('CLICKHOUSE_COMMUNITY_PREFIX_TABLE', 'meta_ip_community_prefix')
+        self.column_defs = [
+            ['prefix', 'String', True],
+            ['organization_name', 'Nullable(String)', True],
+            ['organization_id', 'Nullable(String)', True],
+            ['community', 'Nullable(String)', True],
+            ['id', 'String', True],
+            ['insert_time', 'DateTime DEFAULT now()', False],
+        ]
+        self.table_engine = 'ReplacingMergeTree'
+        self.table_engine_opts = 'insert_time'
+        self.primary_keys = ['prefix']
+        self.order_by = ['prefix', 'id']
+        self.mv_name = self.table + "_mv"
+        self.mv_select_query = f"""
+            SELECT
+                concat(IPv6NumToString(ip_subnet_entry.1), '/', toString(ip_subnet_entry.2)) AS prefix,
+                organization_name,
+                organization_id,
+                community,
+                id
+            FROM {self.source_table_name}
+            ARRAY JOIN ip_subnet AS ip_subnet_entry
+        """
+
+
+class CommunityDictionary(BaseClickHouseDictionaryMixin):
+    """IP_TRIE() dictionary for longest-prefix-match lookups of organization and
+    community info by IP, sourced from the flattened
+    CommunityPrefixMaterializedView table (not the raw meta_ip_community table).
+    """
+
+    def __init__(self, source_table_name: str):
+        super().__init__(source_table_name)
+        self.dictionary_name = os.getenv('CLICKHOUSE_COMMUNITY_DICTIONARY_NAME', 'meta_ip_community_dict')
+        self.column_defs = [
+            ['prefix', 'String'],
+            ['organization_name', 'String'],
+            ['organization_id', 'String'],
+            ['community', 'String'],
+        ]
+        self.primary_keys = ['prefix']
+        #miniumum and maximum lifetime in seconds
+        self.lifetime_min = os.getenv('CLICKHOUSE_COMMUNITY_DICTIONARY_LIFETIME_MIN', "600")
+        self.lifetime_max = os.getenv('CLICKHOUSE_COMMUNITY_DICTIONARY_LIFETIME_MAX', "3600")
+        #set the layout, will be the full layout definition
+        self.layout = "IP_TRIE()"
 

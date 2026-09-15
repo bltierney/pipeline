@@ -2,7 +2,11 @@ import logging
 import os
 import ipaddress
 from datetime import datetime
-from metranova.processors.clickhouse.base import BaseMetadataProcessor
+from metranova.processors.clickhouse.base import (
+    BaseMetadataProcessor,
+    BaseClickHouseDictionaryMixin,
+    BaseClickHouseMaterializedViewMixin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +33,23 @@ class ScienceRegistryProcessor(BaseMetadataProcessor):
             ["scireg_id"],
             ["addresses"]
         ]
-    
+
+        # Build a ClickHouse dictionary for IP -> organization/resource lookups,
+        # same idea as ASDictionary in as.py, except an IP_TRIE() dictionary can't
+        # be sourced directly from this table since ip_subnet is an
+        # Array(Tuple(IPv6,UInt8)) column -- IP_TRIE dictionaries need one row per
+        # prefix. So a materialized view first flattens ip_subnet (one row per
+        # prefix, ARRAY JOIN) into a plain table, and the dictionary is sourced
+        # from that flattened table instead. Both are declared here and created
+        # automatically by ClickHouseBatcher at startup -- no manual SQL script
+        # required, and the dictionary's LIFETIME keeps it refreshed as new scireg
+        # records flow in.
+        self.dictionary_enabled = os.getenv('CLICKHOUSE_SCIREG_DICTIONARY_ENABLED', 'true').lower() in ('true', '1', 'yes')
+        if self.dictionary_enabled:
+            prefix_mv = SciregPrefixMaterializedView(source_table_name=self.table)
+            self.materialized_views.append(prefix_mv)
+            self.ch_dictionaries.append(SciregDictionary(prefix_mv.table))
+
     def match_message(self, value):
         #override base since don't set table in url
         return self.has_match_field(value)
@@ -51,13 +71,13 @@ class ScienceRegistryProcessor(BaseMetadataProcessor):
                     self.logger.warning(f"Invalid IP address format: {addr}")
                     continue
 
+        org_name = value.get('org_name', None)
+
         #init record
         formatted_record = {
             'scireg_update_time': value.get('last_updated', 'unknown'),
             'ip_subnet': ip_subnets,
-            'organization_name': value.get('org_name', None),
-            'organization_id': value.get('org_name', None),
-            'organization_ref': self.pipeline.cacher("redis").lookup("meta_organization", value.get('org_name', None)),
+            'organization_name': org_name,
             'discipline': value.get('discipline', None),
             'latitude': value.get('latitude', None),
             'longitude': value.get('longitude', None),
@@ -67,6 +87,23 @@ class ScienceRegistryProcessor(BaseMetadataProcessor):
             'ext': '{}',
             'tag': []
         }
+
+        # Resolve organization_id/organization_ref via the clickhouse cacher, same
+        # pattern ASMetadataProcessor uses for its own organization lookup -- except
+        # keyed by name (via the cacher's "table:field" composite-key form) since
+        # the science registry only gives us an org name, not a meta_organization id.
+        # NOTE: this requires 'meta_organization:name' to be listed in the
+        # CLICKHOUSE_CACHER_TABLES env var (in addition to 'meta_organization' if
+        # something else, e.g. ASMetadataProcessor, still needs the id-keyed form) --
+        # otherwise this lookup always returns None and organization_id/ref fall
+        # back to the same behavior as before.
+        cached_org_info = self.pipeline.cacher("clickhouse").lookup("meta_organization:name", org_name)
+        if cached_org_info:
+            formatted_record["organization_id"] = cached_org_info.get("id", org_name)
+            formatted_record["organization_ref"] = cached_org_info.get(self.db_ref_field, None)
+        else:
+            formatted_record["organization_id"] = org_name
+            formatted_record["organization_ref"] = None
 
         #format scireg_update_time if equals "unknown"
         if formatted_record['scireg_update_time'] == "unknown":
@@ -87,3 +124,59 @@ class ScienceRegistryProcessor(BaseMetadataProcessor):
                     formatted_record[field] = None
 
         return formatted_record
+
+
+class SciregPrefixMaterializedView(BaseClickHouseMaterializedViewMixin):
+    """Flattens meta_ip_scireg.ip_subnet (one array per org record) into one row
+    per prefix, so it can be used as the SOURCE table for an IP_TRIE() dictionary.
+    """
+
+    def __init__(self, source_table_name: str = "", agg_window: str = ""):
+        super().__init__(source_table_name, agg_window)
+        self.table = os.getenv('CLICKHOUSE_SCIREG_PREFIX_TABLE', 'meta_ip_scireg_prefix')
+        self.column_defs = [
+            ['prefix', 'String', True],
+            ['organization_name', 'Nullable(String)', True],
+            ['organization_id', 'Nullable(String)', True],
+            ['resource_name', 'Nullable(String)', True],
+            ['id', 'String', True],
+            ['insert_time', 'DateTime DEFAULT now()', False],
+        ]
+        self.table_engine = 'ReplacingMergeTree'
+        self.table_engine_opts = 'insert_time'
+        self.primary_keys = ['prefix']
+        self.order_by = ['prefix', 'id']
+        self.mv_name = self.table + "_mv"
+        self.mv_select_query = f"""
+            SELECT
+                concat(IPv6NumToString(ip_subnet_entry.1), '/', toString(ip_subnet_entry.2)) AS prefix,
+                organization_name,
+                organization_id,
+                resource_name,
+                id
+            FROM {self.source_table_name}
+            ARRAY JOIN ip_subnet AS ip_subnet_entry
+        """
+
+
+class SciregDictionary(BaseClickHouseDictionaryMixin):
+    """IP_TRIE() dictionary for longest-prefix-match lookups of organization and
+    resource info by IP, sourced from the flattened SciregPrefixMaterializedView
+    table (not the raw meta_ip_scireg table -- see that class for why).
+    """
+
+    def __init__(self, source_table_name: str):
+        super().__init__(source_table_name)
+        self.dictionary_name = os.getenv('CLICKHOUSE_SCIREG_DICTIONARY_NAME', 'meta_ip_scireg_dict')
+        self.column_defs = [
+            ['prefix', 'String'],
+            ['organization_name', 'String'],
+            ['organization_id', 'String'],
+            ['resource_name', 'String'],
+        ]
+        self.primary_keys = ['prefix']
+        #miniumum and maximum lifetime in seconds
+        self.lifetime_min = os.getenv('CLICKHOUSE_SCIREG_DICTIONARY_LIFETIME_MIN', "600")
+        self.lifetime_max = os.getenv('CLICKHOUSE_SCIREG_DICTIONARY_LIFETIME_MAX', "3600")
+        #set the layout, will be the full layout definition
+        self.layout = "IP_TRIE()"
