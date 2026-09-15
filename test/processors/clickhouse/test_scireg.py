@@ -547,10 +547,20 @@ class TestSciregPrefixMaterializedView(unittest.TestCase):
 
         self.assertIn('CREATE TABLE IF NOT EXISTS meta_ip_scireg_prefix', result)
         self.assertIn('`prefix` String', result)
-        self.assertIn('`organization_name` Nullable(String)', result)
-        self.assertIn('`organization_id` Nullable(String)', result)
-        self.assertIn('`resource_name` Nullable(String)', result)
+        self.assertIn('`organization_name` String', result)
+        self.assertIn('`organization_id` String', result)
+        self.assertIn('`resource_name` String', result)
         self.assertIn('ENGINE = ReplacingMergeTree(insert_time)', result)
+
+    def test_mv_select_query_coalesces_nulls(self):
+        """IP_TRIE dictionaries don't support Nullable attributes, so NULLs
+        from the raw scireg table must be coalesced to '' before they reach
+        the flattened prefix table."""
+        mv = SciregPrefixMaterializedView(source_table_name='meta_ip_scireg')
+
+        self.assertIn("coalesce(organization_name, '') AS organization_name", mv.mv_select_query)
+        self.assertIn("coalesce(organization_id, '') AS organization_id", mv.mv_select_query)
+        self.assertIn("coalesce(resource_name, '') AS resource_name", mv.mv_select_query)
 
     def test_create_mv_command(self):
         mv = SciregPrefixMaterializedView(source_table_name='meta_ip_scireg')
@@ -570,9 +580,9 @@ class TestSciregDictionary(unittest.TestCase):
         self.assertEqual(dictionary.dictionary_name, 'meta_ip_scireg_dict')
         expected_columns = [
             ['prefix', 'String'],
-            ['organization_name', 'String'],
-            ['organization_id', 'String'],
-            ['resource_name', 'String'],
+            ['organization_name', "String DEFAULT ''"],
+            ['organization_id', "String DEFAULT ''"],
+            ['resource_name', "String DEFAULT ''"],
         ]
         self.assertEqual(dictionary.column_defs, expected_columns)
         self.assertEqual(dictionary.primary_keys, ['prefix'])

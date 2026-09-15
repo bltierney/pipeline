@@ -134,11 +134,16 @@ class SciregPrefixMaterializedView(BaseClickHouseMaterializedViewMixin):
     def __init__(self, source_table_name: str = "", agg_window: str = ""):
         super().__init__(source_table_name, agg_window)
         self.table = os.getenv('CLICKHOUSE_SCIREG_PREFIX_TABLE', 'meta_ip_scireg_prefix')
+        #plain (non-nullable) String columns: ClickHouse's IP_TRIE dictionary
+        #layout doesn't support Nullable attributes at all (UNSUPPORTED_METHOD:
+        #"array or nullable attributes not supported for dictionary of type
+        #Trie"), so NULLs are coalesced to '' below in mv_select_query instead
+        #of being passed through as Nullable
         self.column_defs = [
             ['prefix', 'String', True],
-            ['organization_name', 'Nullable(String)', True],
-            ['organization_id', 'Nullable(String)', True],
-            ['resource_name', 'Nullable(String)', True],
+            ['organization_name', 'String', True],
+            ['organization_id', 'String', True],
+            ['resource_name', 'String', True],
             ['id', 'String', True],
             ['insert_time', 'DateTime DEFAULT now()', False],
         ]
@@ -150,9 +155,9 @@ class SciregPrefixMaterializedView(BaseClickHouseMaterializedViewMixin):
         self.mv_select_query = f"""
             SELECT
                 concat(IPv6NumToString(ip_subnet_entry.1), '/', toString(ip_subnet_entry.2)) AS prefix,
-                organization_name,
-                organization_id,
-                resource_name,
+                coalesce(organization_name, '') AS organization_name,
+                coalesce(organization_id, '') AS organization_id,
+                coalesce(resource_name, '') AS resource_name,
                 id
             FROM {self.source_table_name}
             ARRAY JOIN ip_subnet AS ip_subnet_entry
@@ -168,16 +173,14 @@ class SciregDictionary(BaseClickHouseDictionaryMixin):
     def __init__(self, source_table_name: str):
         super().__init__(source_table_name)
         self.dictionary_name = os.getenv('CLICKHOUSE_SCIREG_DICTIONARY_NAME', 'meta_ip_scireg_dict')
-        #these are Nullable(String) (not plain String) since the source prefix
-        #table's columns are nullable too (e.g. resource_name is frequently
-        #unset on real scireg records) -- a non-nullable attribute type here
-        #makes SYSTEM RELOAD DICTIONARY fail with CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN
-        #the moment any source row has a null value
+        #plain String, not Nullable(String) -- IP_TRIE doesn't support nullable
+        #attributes, so unset values arrive as '' (coalesced upstream in
+        #SciregPrefixMaterializedView.mv_select_query) rather than NULL
         self.column_defs = [
             ['prefix', 'String'],
-            ['organization_name', 'Nullable(String)'],
-            ['organization_id', 'Nullable(String)'],
-            ['resource_name', 'Nullable(String)'],
+            ['organization_name', "String DEFAULT ''"],
+            ['organization_id', "String DEFAULT ''"],
+            ['resource_name', "String DEFAULT ''"],
         ]
         self.primary_keys = ['prefix']
         #miniumum and maximum lifetime in seconds

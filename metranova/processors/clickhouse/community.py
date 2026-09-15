@@ -129,11 +129,16 @@ class CommunityPrefixMaterializedView(BaseClickHouseMaterializedViewMixin):
     def __init__(self, source_table_name: str = "", agg_window: str = ""):
         super().__init__(source_table_name, agg_window)
         self.table = os.getenv('CLICKHOUSE_COMMUNITY_PREFIX_TABLE', 'meta_ip_community_prefix')
+        #plain (non-nullable) String columns: ClickHouse's IP_TRIE dictionary
+        #layout doesn't support Nullable attributes at all (UNSUPPORTED_METHOD:
+        #"array or nullable attributes not supported for dictionary of type
+        #Trie"), so NULLs are coalesced to '' below in mv_select_query instead
+        #of being passed through as Nullable
         self.column_defs = [
             ['prefix', 'String', True],
-            ['organization_name', 'Nullable(String)', True],
-            ['organization_id', 'Nullable(String)', True],
-            ['community', 'Nullable(String)', True],
+            ['organization_name', 'String', True],
+            ['organization_id', 'String', True],
+            ['community', 'String', True],
             ['id', 'String', True],
             ['insert_time', 'DateTime DEFAULT now()', False],
         ]
@@ -145,9 +150,9 @@ class CommunityPrefixMaterializedView(BaseClickHouseMaterializedViewMixin):
         self.mv_select_query = f"""
             SELECT
                 concat(IPv6NumToString(ip_subnet_entry.1), '/', toString(ip_subnet_entry.2)) AS prefix,
-                organization_name,
-                organization_id,
-                community,
+                coalesce(organization_name, '') AS organization_name,
+                coalesce(organization_id, '') AS organization_id,
+                coalesce(community, '') AS community,
                 id
             FROM {self.source_table_name}
             ARRAY JOIN ip_subnet AS ip_subnet_entry
@@ -163,13 +168,14 @@ class CommunityDictionary(BaseClickHouseDictionaryMixin):
     def __init__(self, source_table_name: str):
         super().__init__(source_table_name)
         self.dictionary_name = os.getenv('CLICKHOUSE_COMMUNITY_DICTIONARY_NAME', 'meta_ip_community_dict')
-        #Nullable(String), matching the source prefix table's nullable columns --
-        #see the matching comment in scireg.py's SciregDictionary for why
+        #plain String, not Nullable(String) -- IP_TRIE doesn't support nullable
+        #attributes, so unset values arrive as '' (coalesced upstream in
+        #CommunityPrefixMaterializedView.mv_select_query) rather than NULL
         self.column_defs = [
             ['prefix', 'String'],
-            ['organization_name', 'Nullable(String)'],
-            ['organization_id', 'Nullable(String)'],
-            ['community', 'Nullable(String)'],
+            ['organization_name', "String DEFAULT ''"],
+            ['organization_id', "String DEFAULT ''"],
+            ['community', "String DEFAULT ''"],
         ]
         self.primary_keys = ['prefix']
         #miniumum and maximum lifetime in seconds
