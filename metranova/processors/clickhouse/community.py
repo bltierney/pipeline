@@ -163,11 +163,13 @@ class CommunityDictionary(BaseClickHouseDictionaryMixin):
     def __init__(self, source_table_name: str):
         super().__init__(source_table_name)
         self.dictionary_name = os.getenv('CLICKHOUSE_COMMUNITY_DICTIONARY_NAME', 'meta_ip_community_dict')
+        #Nullable(String), matching the source prefix table's nullable columns --
+        #see the matching comment in scireg.py's SciregDictionary for why
         self.column_defs = [
             ['prefix', 'String'],
-            ['organization_name', 'String'],
-            ['organization_id', 'String'],
-            ['community', 'String'],
+            ['organization_name', 'Nullable(String)'],
+            ['organization_id', 'Nullable(String)'],
+            ['community', 'Nullable(String)'],
         ]
         self.primary_keys = ['prefix']
         #miniumum and maximum lifetime in seconds

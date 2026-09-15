@@ -168,11 +168,16 @@ class SciregDictionary(BaseClickHouseDictionaryMixin):
     def __init__(self, source_table_name: str):
         super().__init__(source_table_name)
         self.dictionary_name = os.getenv('CLICKHOUSE_SCIREG_DICTIONARY_NAME', 'meta_ip_scireg_dict')
+        #these are Nullable(String) (not plain String) since the source prefix
+        #table's columns are nullable too (e.g. resource_name is frequently
+        #unset on real scireg records) -- a non-nullable attribute type here
+        #makes SYSTEM RELOAD DICTIONARY fail with CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN
+        #the moment any source row has a null value
         self.column_defs = [
             ['prefix', 'String'],
-            ['organization_name', 'String'],
-            ['organization_id', 'String'],
-            ['resource_name', 'String'],
+            ['organization_name', 'Nullable(String)'],
+            ['organization_id', 'Nullable(String)'],
+            ['resource_name', 'Nullable(String)'],
         ]
         self.primary_keys = ['prefix']
         #miniumum and maximum lifetime in seconds
