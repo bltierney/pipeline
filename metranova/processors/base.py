@@ -5,6 +5,9 @@ logger = logging.getLogger(__name__)
 
 class BaseProcessor:
     def __init__(self, pipeline):
+        # Initialize parent class - need this for multiple inheritance
+        super().__init__()
+
         # setup logger
         self.logger = logger
 
@@ -19,6 +22,10 @@ class BaseProcessor:
 
     def has_required_fields(self, value: dict) -> bool:
         """Check if the message contains all required fields"""
+        #make sure value is a dict
+        if not isinstance(value, dict):
+            self.logger.debug(f"Expected message value to be a dict, got {type(value)}")
+            return False
         # NOTE: Call this in build_message instead of match_message to allow more detailed logging
         # This means the message matched the processor, but there is a problem with the content
         for fields in self.required_fields:

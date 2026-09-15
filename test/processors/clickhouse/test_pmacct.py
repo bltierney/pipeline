@@ -26,12 +26,17 @@ class TestPMAcctFlowProcessor(unittest.TestCase):
         
         mock_ip_cacher = Mock()
         mock_ip_cacher.lookup.return_value = None
+
+        mock_clickhouse_ranged_cacher = Mock()
+        mock_clickhouse_ranged_cacher.lookup_dict_key.return_value = None
         
         def cacher_side_effect(name):
             if name == "clickhouse":
                 return mock_clickhouse_cacher
             elif name == "ip":
                 return mock_ip_cacher
+            elif name == "clickhouse_ranged":
+                return mock_clickhouse_ranged_cacher
             return Mock()
         
         self.mock_pipeline.cacher.side_effect = cacher_side_effect
@@ -160,7 +165,7 @@ class TestPMAcctFlowProcessor(unittest.TestCase):
 
     def test_lookup_ip_as_fields_with_ip_cache_hit(self):
         """Test lookup_ip_as_fields when IP is found in cache."""
-        mock_ip_result = {'ref': 'ip_ref_123', 'as_id': 65001}
+        mock_ip_result = ('ip_ref_123', 65001)
         
         def cacher_side_effect(name):
             if name == "ip":
@@ -170,6 +175,10 @@ class TestPMAcctFlowProcessor(unittest.TestCase):
             elif name == "clickhouse":
                 mock_cacher = Mock()
                 mock_cacher.lookup_dict_key.return_value = 'as_ref_123'
+                return mock_cacher
+            elif name == "clickhouse_ranged":
+                mock_cacher = Mock()
+                mock_cacher.lookup_dict_key.return_value = None
                 return mock_cacher
             return Mock()
         
@@ -209,6 +218,10 @@ class TestPMAcctFlowProcessor(unittest.TestCase):
                 mock_cacher = Mock()
                 mock_cacher.lookup.side_effect = lambda table, key: mock_interface if 'True' in key else None
                 return mock_cacher
+            elif name == "clickhouse_ranged":
+                mock_cacher = Mock()
+                mock_cacher.lookup_dict_key.return_value = None
+                return mock_cacher
             return Mock()
         
         self.mock_pipeline.cacher.side_effect = cacher_side_effect
@@ -240,6 +253,10 @@ class TestPMAcctFlowProcessor(unittest.TestCase):
             if name == "clickhouse":
                 mock_cacher = Mock()
                 mock_cacher.lookup.return_value = mock_device
+                return mock_cacher
+            elif name == "clickhouse_ranged":
+                mock_cacher = Mock()
+                mock_cacher.lookup_dict_key.return_value = None
                 return mock_cacher
             return Mock()
         
@@ -619,7 +636,7 @@ class TestPMAcctFlowProcessor(unittest.TestCase):
 
     def test_lookup_ip_as_fields_with_zero_as_id(self):
         """Test lookup_ip_as_fields when AS ID is 0 (should try to get from IP cache)."""
-        mock_ip_result = {'ref': 'ip_ref_123', 'as_id': 65001}
+        mock_ip_result = ('ip_ref_123', 65001)
         
         def cacher_side_effect(name):
             if name == "ip":
@@ -629,6 +646,10 @@ class TestPMAcctFlowProcessor(unittest.TestCase):
             elif name == "clickhouse":
                 mock_cacher = Mock()
                 mock_cacher.lookup_dict_key.return_value = 'as_ref_123'
+                return mock_cacher
+            elif name == "clickhouse_ranged":
+                mock_cacher = Mock()
+                mock_cacher.lookup_dict_key.return_value = None
                 return mock_cacher
             return Mock()
         
@@ -645,7 +666,7 @@ class TestPMAcctFlowProcessor(unittest.TestCase):
 
     def test_lookup_ip_as_fields_with_invalid_as_id(self):
         """Test lookup_ip_as_fields when AS ID can't be converted to int."""
-        mock_ip_result = {'ref': 'ip_ref_123', 'as_id': 65001}
+        mock_ip_result = ('ip_ref_123', 65001)
         
         def cacher_side_effect(name):
             if name == "ip":
@@ -653,6 +674,10 @@ class TestPMAcctFlowProcessor(unittest.TestCase):
                 mock_cacher.lookup.return_value = mock_ip_result
                 return mock_cacher
             elif name == "clickhouse":
+                mock_cacher = Mock()
+                mock_cacher.lookup_dict_key.return_value = None
+                return mock_cacher
+            elif name == "clickhouse_ranged":
                 mock_cacher = Mock()
                 mock_cacher.lookup_dict_key.return_value = None
                 return mock_cacher

@@ -96,8 +96,68 @@ This document describes all environment variables used by the MetrANOVA Pipeline
 | `CLICKHOUSE_FLOW_TYPE` | `unknown` | Flow data type identifier |
 | `CLICKHOUSE_FLOW_EXTENSIONS` | (none) | Comma-separated list of flow extensions to enable (e.g., `bgp,ipv4,ipv6,mpls`) |
 | `CLICKHOUSE_FLOW_IP_REF_EXTENSIONS` | (none) | Comma-separated list of IP reference extensions (e.g., `scireg`) |
+| `CLICKHOUSE_FLOW_IP_TO_AS_LOOKUP_ORDER` | `meta_ip` | Comma-separated preference order of IP metadata tables to use for AS lookups when AS is not provided in flow record (e.g., `meta_ip,meta_ip_scireg,meta_ip_cric`) |
 | `CLICKHOUSE_FLOW_POLICY_AUTO_SCOPES` | `true` | Automatically determine policy scopes from BGP communities |
 | `CLICKHOUSE_FLOW_POLICY_COMMUNITY_SCOPE_MAP` | (none) | Map BGP communities to policy scopes (format: `community:scope,community:scope`) |
+
+## ClickHouse Materialized Views
+
+Materialized views provide pre-aggregated data for faster queries. Each materialized view type can have multiple aggregation windows defined.
+
+### Flow Materialized View Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLICKHOUSE_FLOW_MV_BY_EDGE_AS` | (none) | Comma-separated list of aggregation windows for edge AS materialized views (e.g., `5m,1h,1d,1w`) |
+| `CLICKHOUSE_FLOW_MV_BY_INTERFACE` | (none) | Comma-separated list of aggregation windows for interface materialized views (e.g., `5m,1h,1d`) |
+| `CLICKHOUSE_FLOW_MV_BY_IP_VERSION` | (none) | Comma-separated list of aggregation windows for IP version materialized views (e.g., `1h,1d,1w`) |
+| `CLICKHOUSE_FLOW_MV_ANONYMIZED` | (none) | Comma-separated list of aggregation windows for anonymized flow materialized views (e.g., `5m,1h,1d`) |
+
+### Per-Window Materialized View Settings
+
+For each materialized view type and aggregation window (replace `{MV_TYPE}` with `EDGE_AS`, `INTERFACE`, `IP_VERSION`, or `ANONYMIZED`, and `{WINDOW}` with the uppercase window like `5M`, `1H`, `1D`, `1W`, `1MO`, `1Y`):
+
+| Variable Pattern | Default | Description |
+|----------|---------|-------------|
+| `CLICKHOUSE_FLOW_MV_BY_{MV_TYPE}_{WINDOW}_TABLE` | `data_flow_by_{type}_{window}` | Custom table name for the materialized view |
+| `CLICKHOUSE_FLOW_MV_BY_{MV_TYPE}_{WINDOW}_TTL` | `5 YEAR` | TTL for materialized view table |
+| `CLICKHOUSE_FLOW_MV_BY_{MV_TYPE}_{WINDOW}_TTL_COLUMN` | `start_time` | Column to use for TTL calculation |
+| `CLICKHOUSE_FLOW_MV_BY_{MV_TYPE}_{WINDOW}_PARTITION_BY` | `toYYYYMMDD(start_time)` | Partition expression for materialized view table |
+| `CLICKHOUSE_FLOW_MV_BY_{MV_TYPE}_{WINDOW}_POLICY_LEVEL` | `tlp:green` | Policy level override for aggregated data |
+| `CLICKHOUSE_FLOW_MV_BY_{MV_TYPE}_{WINDOW}_POLICY_SCOPE` | `comm:re` | Policy scope override (comma-separated list) |
+| `CLICKHOUSE_FLOW_MV_BY_{MV_TYPE}_{WINDOW}_POLICY_OVERRIDE` | `true` | Enable policy override for this materialized view |
+
+### Anonymized Materialized View IP Masking
+
+The `ANONYMIZED` materialized view masks source, destination, and peer IP addresses by zeroing the host bits, preserving only a leading network prefix. The prefix lengths are configurable per aggregation window. Addresses are stored as IPv6, so IPv4 addresses are mapped to `::ffff:0:0/96` — an IPv4 `/N` corresponds to an IPv6 prefix of `96+N`. Multicast/reserved ranges (`224.0.0.0/4`, `ff00::/8`, `2002::/16`) are passed through unmasked.
+
+| Variable Pattern | Default | Description |
+|----------|---------|-------------|
+| `CLICKHOUSE_FLOW_MV_ANONYMIZED_{WINDOW}_IPV4_PREFIX` | `117` | IPv6 prefix length (leading bits preserved) when masking IPv4 addresses. Default `117` keeps `117 - 96 = 21` IPv4 host bits, i.e. an IPv4 `/21` |
+| `CLICKHOUSE_FLOW_MV_ANONYMIZED_{WINDOW}_IPV6_PREFIX` | `48` | IPv6 prefix length (leading bits preserved) when masking IPv6 addresses, i.e. an IPv6 `/48` |
+
+
+## ClickHouse Dictionary Settings
+
+Dictionaries provide fast lookup capabilities for metadata enrichment. Each metadata type can have its own dictionary configuration.
+
+### Application Dictionary
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLICKHOUSE_APPLICATION_DICTIONARY_ENABLED` | `true` | Enable application metadata dictionary creation |
+| `CLICKHOUSE_APPLICATION_DICTIONARY_NAME` | `meta_application_dict` | Dictionary name for application lookups |
+| `CLICKHOUSE_APPLICATION_DICTIONARY_LIFETIME_MIN` | `600` | Minimum cache lifetime in seconds (10 minutes) |
+| `CLICKHOUSE_APPLICATION_DICTIONARY_LIFETIME_MAX` | `3600` | Maximum cache lifetime in seconds (1 hour) |
+
+### AS Dictionary
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLICKHOUSE_AS_DICTIONARY_ENABLED` | `true` | Enable AS metadata dictionary creation |
+| `CLICKHOUSE_AS_DICTIONARY_NAME` | `meta_as_dict` | Dictionary name for AS lookups |
+| `CLICKHOUSE_AS_DICTIONARY_LIFETIME_MIN` | `600` | Minimum cache lifetime in seconds (10 minutes) |
+| `CLICKHOUSE_AS_DICTIONARY_LIFETIME_MAX` | `3600` | Maximum cache lifetime in seconds (1 hour) |
 
 ## ClickHouse Metadata Processing
 
@@ -105,6 +165,7 @@ This document describes all environment variables used by the MetrANOVA Pipeline
 |----------|---------|-------------|
 | `CLICKHOUSE_METADATA_FORCE_UPDATE` | `false` | Force metadata updates even if no changes detected |
 | `CLICKHOUSE_AS_METADATA_EXTENSIONS` | (none) | Comma-separated list of AS metadata extensions (e.g., `peeringdb`) |
+| `CLICKHOUSE_IF_METADATA_EXTENSIONS` | (none) | Comma-separated list of interface metadata extensions (e.g., `sap,vrtr,vrtr_interface`) |
 
 ## ClickHouse Processor Policy Settings
 
@@ -136,6 +197,15 @@ This document describes all environment variables used by the MetrANOVA Pipeline
 | `CLICKHOUSE_CACHER_MAX_SIZE` | `100000000` | Maximum number of cache entries (100 million) |
 | `CLICKHOUSE_CACHER_MAX_TTL` | `86400` | Cache entry TTL in seconds (1 day) |
 | `CLICKHOUSE_CACHER_REFRESH_INTERVAL` | `600` | Seconds between cache refresh operations |
+| `CLICKHOUSE_RANGED_CACHER_CONFIGS` | (empty) | Comma-separated ranged mappings in the format `lookup_table:clickhouse_table:min_col:max_col:key_col:val_col` ( `clickhouse_table:min_col:max_col:key_col:val_col` is also supported) |
+| `CLICKHOUSE_RANGED_CACHER_LOOKUP_TABLE` | `CLICKHOUSE_RANGED_CACHER_TABLE` | Fallback lookup-table alias used as the local cache key |
+| `CLICKHOUSE_RANGED_CACHER_TABLE` | `meta_application_dict` | Fallback single ranged table name when `CLICKHOUSE_RANGED_CACHER_CONFIGS` is unset |
+| `CLICKHOUSE_RANGED_CACHER_MIN_COLUMN` | `port_range_min` | Fallback minimum port column name |
+| `CLICKHOUSE_RANGED_CACHER_MAX_COLUMN` | `port_range_max` | Fallback maximum port column name |
+| `CLICKHOUSE_RANGED_CACHER_KEY_COLUMN` | `protocol` | Fallback key column name for the first cache key |
+| `CLICKHOUSE_RANGED_CACHER_VAL_COLUMN` | `id` | Fallback value column name stored at `key -> port` |
+| `CLICKHOUSE_RANGED_CACHER_KEY_COLUMN` | `protocol` | Fallback key column name (used when `CLICKHOUSE_RANGED_CACHER_KEY_COLUMN` is unset) |
+| `CLICKHOUSE_RANGED_CACHER_ID_COLUMN` | `id` | Fallback value column name (used when `CLICKHOUSE_RANGED_CACHER_VAL_COLUMN` is unset) |
 
 ## Kafka Consumer Settings
 
@@ -146,6 +216,15 @@ This document describes all environment variables used by the MetrANOVA Pipeline
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Comma-separated list of Kafka broker addresses |
 | `KAFKA_TOPIC` | `metranova_flow` | Kafka topic to consume |
 | `KAFKA_CONSUMER_GROUP` | `ch-writer-group` | Consumer group ID |
+
+### SASL/PLAIN Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `KAFKA_SASL_USERNAME` | (none) | SASL username for Kafka authentication |
+| `KAFKA_SASL_PASSWORD` | (none) | SASL password for Kafka authentication |
+
+When both `KAFKA_SASL_USERNAME` and `KAFKA_SASL_PASSWORD` are set, the connector uses SASL/PLAIN authentication. If `KAFKA_SSL_CA_LOCATION` exists, it uses `SASL_SSL`; otherwise it falls back to `SASL_PLAINTEXT`.
 
 ### SSL/TLS Configuration
 
