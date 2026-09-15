@@ -10,6 +10,25 @@ from metranova.processors.clickhouse.base import (
 
 logger = logging.getLogger(__name__)
 
+
+def _trie_prefix_length(ip_str: str, prefix_length: int) -> int:
+    """ip_subnet is stored as Array(Tuple(IPv6, UInt8)) -- ClickHouse maps an
+    IPv4 address into that 128-bit space as ::ffff:a.b.c.d, a fixed 96-bit
+    prefix, so an IPv4 CIDR's prefix length has to be offset by 96 to stay
+    correct once embedded there (e.g. 129.114.63.128/27 -> /123). Without
+    this, the IP_TRIE() dictionary built from this data only ever compares
+    the leading 96 always-zero/::ffff: bits shared by every IPv4-mapped
+    address, so every IPv4 lookup spuriously "matches" every stored prefix.
+    Native IPv6 addresses need no adjustment.
+    """
+    try:
+        if ipaddress.ip_address(ip_str).version == 4:
+            return prefix_length + 96
+    except ValueError:
+        pass
+    return prefix_length
+
+
 class ScienceRegistryProcessor(BaseMetadataProcessor):
     def __init__(self, pipeline):
         super().__init__(pipeline)
@@ -58,15 +77,23 @@ class ScienceRegistryProcessor(BaseMetadataProcessor):
         #iterate over strings in value['addresses'] and build a new list of tuples where first element is IP address and second is prefix length.
         ip_subnets = []
         for addr in value['addresses']:
-            #if has slash use otherwise default to 32 for ipv4 and 128 for ipv6
+            #if has slash use otherwise default to a full-length host prefix
             if '/' in addr:
                 ip, prefix = addr.split('/', 1)
-                ip_subnets.append((ip, int(prefix)))
+                try:
+                    prefix = int(prefix)
+                except ValueError:
+                    self.logger.warning(f"Invalid IP address format: {addr}")
+                    continue
+                ip_subnets.append((ip, _trie_prefix_length(ip, prefix)))
             else:
                 try:
-                    ip_obj = ipaddress.ip_address(addr)
-                    default_prefix = 32 if ip_obj.version == 4 else 128
-                    ip_subnets.append((addr, default_prefix))
+                    ipaddress.ip_address(addr)
+                    # a bare host address is always a full-length /128 once
+                    # embedded in the IPv6 storage column, whether it started
+                    # as IPv4 (32 + the 96-bit offset) or native IPv6 -- see
+                    # _trie_prefix_length
+                    ip_subnets.append((addr, 128))
                 except (ipaddress.AddressValueError, ValueError):
                     self.logger.warning(f"Invalid IP address format: {addr}")
                     continue

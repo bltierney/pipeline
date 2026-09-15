@@ -9,6 +9,25 @@ from metranova.processors.clickhouse.base import (
 
 logger = logging.getLogger(__name__)
 
+
+def _trie_prefix_length(ip_str: str, prefix_length: int) -> int:
+    """ip_subnet is stored as Array(Tuple(IPv6, UInt8)) -- ClickHouse maps an
+    IPv4 address into that 128-bit space as ::ffff:a.b.c.d, a fixed 96-bit
+    prefix, so an IPv4 CIDR's prefix length has to be offset by 96 to stay
+    correct once embedded there (e.g. 129.114.63.128/27 -> /123). Without
+    this, the IP_TRIE() dictionary built from this data only ever compares
+    the leading 96 always-zero/::ffff: bits shared by every IPv4-mapped
+    address, so every IPv4 lookup spuriously "matches" every stored prefix.
+    Native IPv6 addresses need no adjustment.
+    """
+    try:
+        if ipaddress.ip_address(ip_str).version == 4:
+            return prefix_length + 96
+    except ValueError:
+        pass
+    return prefix_length
+
+
 class CommunityRegistryProcessor(BaseMetadataProcessor):
     def __init__(self, pipeline):
         super().__init__(pipeline)
@@ -60,23 +79,28 @@ class CommunityRegistryProcessor(BaseMetadataProcessor):
                 self.logger.warning(f"Invalid IP address format: {addr}")
                 continue
 
-            ip_subnets.append((ip, prefix))
+            ip_subnets.append((ip, _trie_prefix_length(ip, prefix)))
 
             #subnets smaller than /24 (IPv4) or /64 (IPv6) are often the result of
             #de-identification elsewhere, where the host portion of the address is
             #replaced with the value 1 (e.g. .1 for IPv4, ::1 for IPv6). Add that
             #address too so we can still match against data anonymized that way.
+            #NOTE: this comparison and ipaddress.ip_network() call below both need
+            #the original, un-offset prefix length (real-world IPv4/IPv6 semantics),
+            #not the trie-storage-adjusted one from _trie_prefix_length above.
             try:
                 version = ipaddress.ip_address(ip).version
             except ValueError:
                 self.logger.warning(f"Invalid IP address format: {addr}")
                 continue
             boundary_prefix = 24 if version == 4 else 64
-            host_prefix = 32 if version == 4 else 128
             if prefix > boundary_prefix:
                 network = ipaddress.ip_network(f"{ip}/{boundary_prefix}", strict=False)
                 deidentified_ip = network.network_address + 1
-                ip_subnets.append((str(deidentified_ip), host_prefix))
+                # a single de-identified host is always a full-length /128
+                # once embedded in the IPv6 storage column -- see
+                # _trie_prefix_length
+                ip_subnets.append((str(deidentified_ip), 128))
 
         #de-duplicate while preserving order (multiple narrow subnets can share
         #the same enclosing /24 or /64, which would otherwise generate the same

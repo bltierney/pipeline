@@ -126,10 +126,15 @@ class TestScienceRegistryProcessor(unittest.TestCase):
         self.assertEqual(record["project_name"], "Test Project")
         self.assertEqual(record["contact_email"], "test@example.com")
         
-        # Verify IP subnet processing
+        # Verify IP subnet processing. ip_subnet is stored as Array(Tuple(IPv6,
+        # UInt8)): IPv4 addresses get mapped into that 128-bit space as
+        # ::ffff:a.b.c.d (a fixed 96-bit prefix), so IPv4 CIDR lengths are
+        # offset by 96 to stay correct once embedded there (24 -> 120); a bare
+        # IPv4 host address becomes a full-length /128, same as IPv6. Native
+        # IPv6 CIDR lengths (e.g. the /64 below) are untouched.
         expected_subnets = [
-            ("192.168.1.0", 24),
-            ("10.0.0.1", 32),  # IPv4 default
+            ("192.168.1.0", 120),
+            ("10.0.0.1", 128),  # IPv4 default
             ("2001:db8::1", 64)
         ]
         self.assertEqual(record["ip_subnet"], expected_subnets)
@@ -165,9 +170,10 @@ class TestScienceRegistryProcessor(unittest.TestCase):
         self.assertIn("Org 2", org_names)
     
     def test_build_message_ipv4_default_prefix(self):
-        """Test that IPv4 addresses without CIDR get /32 prefix."""
+        """Test that IPv4 addresses without CIDR get a full-length /128 prefix
+        (since ip_subnet stores them as IPv4-mapped IPv6, ::ffff:a.b.c.d)."""
         processor = ScienceRegistryProcessor(self.mock_pipeline)
-        
+
         input_data = {
             "data": [
                 {
@@ -176,11 +182,11 @@ class TestScienceRegistryProcessor(unittest.TestCase):
                 }
             ]
         }
-        
+
         result = processor.build_message(input_data, {})
         record = result[0]
-        
-        self.assertEqual(record["ip_subnet"], [("192.168.1.1", 32)])
+
+        self.assertEqual(record["ip_subnet"], [("192.168.1.1", 128)])
     
     def test_build_message_ipv6_default_prefix(self):
         """Test that IPv6 addresses without CIDR get /128 prefix."""
@@ -221,7 +227,7 @@ class TestScienceRegistryProcessor(unittest.TestCase):
             mock_warning.assert_called_with("Invalid IP address format: invalid.ip.address")
             
             # Should only include valid IP
-            self.assertEqual(record["ip_subnet"], [("192.168.1.1", 32)])
+            self.assertEqual(record["ip_subnet"], [("192.168.1.1", 128)])
     
     def test_build_message_unknown_last_updated(self):
         """Test handling of unknown last_updated date."""
@@ -399,13 +405,13 @@ class TestScienceRegistryProcessor(unittest.TestCase):
         record = result[0]
         
         expected_subnets = [
-            ("192.168.1.0", 24),
-            ("10.0.0.1", 32),
-            ("2001:db8::", 32),
+            ("192.168.1.0", 120),  # IPv4 /24 -> /120 (96-bit ::ffff: offset)
+            ("10.0.0.1", 128),
+            ("2001:db8::", 32),    # native IPv6, no offset
             ("fe80::1", 128),
             ("::1", 128)
         ]
-        
+
         self.assertEqual(record["ip_subnet"], expected_subnets)
     
     def test_organization_id_mapping_no_cache_match(self):

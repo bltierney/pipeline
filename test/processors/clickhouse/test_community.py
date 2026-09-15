@@ -97,7 +97,9 @@ class TestCommunityRegistryProcessor(unittest.TestCase):
             record = result[0]
 
             mock_warning.assert_called_with("Missing prefix length (no '/'): 198.189.140.1")
-            self.assertEqual(record["ip_subnet"], [("198.189.140.0", 24)])
+            # ip_subnet stores IPv4 as ::ffff:a.b.c.d (a 96-bit offset), so a
+            # /24 IPv4 CIDR becomes /120 once embedded there.
+            self.assertEqual(record["ip_subnet"], [("198.189.140.0", 120)])
 
     def test_build_message_deidentified_address_added_ipv4(self):
         """A /24-or-narrower IPv4 subnet should also add the .1 de-identified host address."""
@@ -114,9 +116,11 @@ class TestCommunityRegistryProcessor(unittest.TestCase):
         result = processor.build_message(input_data, {})
         record = result[0]
 
+        # /25 -> /121 (96-bit offset); the de-identified host is always a
+        # full-length /128 once embedded in the IPv6 storage column.
         self.assertEqual(record["ip_subnet"], [
-            ("198.189.140.0", 25),
-            ("198.189.140.1", 32),
+            ("198.189.140.0", 121),
+            ("198.189.140.1", 128),
         ])
 
     def test_build_message_deidentified_address_added_ipv6(self):
@@ -154,7 +158,8 @@ class TestCommunityRegistryProcessor(unittest.TestCase):
         result = processor.build_message(input_data, {})
         record = result[0]
 
-        self.assertEqual(record["ip_subnet"], [("130.157.0.0", 16)])
+        # /16 -> /112 (96-bit offset for IPv4-mapped storage)
+        self.assertEqual(record["ip_subnet"], [("130.157.0.0", 112)])
 
     def test_build_message_dedup_shared_deidentified_address(self):
         """Multiple narrow subnets sharing an enclosing /24 shouldn't duplicate the de-identified address."""
@@ -172,9 +177,9 @@ class TestCommunityRegistryProcessor(unittest.TestCase):
         record = result[0]
 
         self.assertEqual(record["ip_subnet"], [
-            ("198.189.140.0", 25),
-            ("198.189.140.1", 32),
-            ("198.189.140.128", 25),
+            ("198.189.140.0", 121),
+            ("198.189.140.1", 128),
+            ("198.189.140.128", 121),
         ])
 
     def test_build_message_invalid_asn(self):
