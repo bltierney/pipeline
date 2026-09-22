@@ -387,7 +387,9 @@ class MaterializedViewAnonymizedFlow(BaseClickHouseMaterializedViewMixin):
             raise ValueError("agg_window must be provided for MaterializedViewAnonymizedFlow")
         
         self.column_defs = [
-            ['start_time', 'DateTime', True],
+            ['start_time', "DateTime64(3, 'UTC')", True],
+            ['end_time', "DateTime64(3, 'UTC')", True],
+            ['duration', 'Float64', True],
             ['collector_id', 'LowCardinality(String)', True],
             ['policy_originator', 'LowCardinality(Nullable(String))', True],
             ['policy_level', 'LowCardinality(Nullable(String))', True],
@@ -532,7 +534,9 @@ class MaterializedViewAnonymizedFlow(BaseClickHouseMaterializedViewMixin):
 
         self.mv_select_query = f"""
             SELECT
-                toStartOfInterval(start_time, INTERVAL {self.agg_window_ch_interval}) AS start_time,
+                start_time,
+                end_time,
+                dateDiff('millisecond', start_time, end_time) / 1000.0 AS duration,
                 collector_id,
                 policy_originator,
                 {policy_level_term},
