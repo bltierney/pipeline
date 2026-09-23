@@ -137,6 +137,25 @@ The `ANONYMIZED` materialized view masks source, destination, and peer IP addres
 | `CLICKHOUSE_FLOW_MV_ANONYMIZED_{WINDOW}_IPV6_PREFIX` | `48` | IPv6 prefix length (leading bits preserved) when masking IPv6 addresses, i.e. an IPv6 `/48` |
 
 
+## ClickHouse Flow Stitching
+
+`FlowStitchingProcessor` reconstructs full flow records from individual flow-cache export slices -- the netflow/sflow equivalent of Logstash's `aggregate` filter. Slices sharing the same fingerprint (device, source/destination IP and port, protocol, ingress/egress interface) are accumulated in memory and merged into a single record once the flow goes idle past `INACTIVITY_TIMEOUT` or exceeds `MAX_TIMEOUT`, rather than being written to ClickHouse as separate rows. A background sweep thread checks for idle/expired flows every `SWEEP_INTERVAL` seconds. Accumulator state is kept in memory only and any flow still accumulating at process restart is lost, not flushed.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLICKHOUSE_FLOW_STITCH_ENABLED` | `false` | Master on/off switch. Off by default: when `false`, this processor never matches a message, creates no table, and starts no background sweep thread |
+| `CLICKHOUSE_FLOW_STITCH_TABLE` | `data_flow_anonymized` | Table for completed, stitched flow records |
+| `CLICKHOUSE_FLOW_STITCH_TTL` | `5 YEAR` | TTL for the stitched flow table |
+| `CLICKHOUSE_FLOW_STITCH_TTL_COLUMN` | `start_time` | Column to use for TTL calculation |
+| `CLICKHOUSE_FLOW_STITCH_PARTITION_BY` | `toYYYYMMDD(start_time)` | Partition expression for the stitched flow table |
+| `CLICKHOUSE_FLOW_STITCH_INACTIVITY_TIMEOUT` | `630` | Seconds of wall-clock inactivity before an in-progress flow is flushed as complete |
+| `CLICKHOUSE_FLOW_STITCH_MAX_TIMEOUT` | `86400` | Maximum flow duration in seconds (event-time span between first and last slice); flows exceeding this are flushed even while still active |
+| `CLICKHOUSE_FLOW_STITCH_SWEEP_INTERVAL` | `30` | Seconds between background sweeps that check for idle/expired flows |
+| `CLICKHOUSE_FLOW_STITCH_IPV4_PREFIX` | `117` | IPv6 prefix length (leading bits preserved) when masking IPv4 addresses in stitched records, same scheme as the [anonymized materialized views](#anonymized-materialized-view-ip-masking) |
+| `CLICKHOUSE_FLOW_STITCH_IPV6_PREFIX` | `48` | IPv6 prefix length (leading bits preserved) when masking IPv6 addresses in stitched records |
+
+`FlowStitchingProcessor` is not wired into a pipeline YAML by default. To use it, add `metranova.processors.clickhouse.flow_stitching.FlowStitchingProcessor` to a writer's `processors:` list, alongside `PMAcctFlowProcessor`, and set `CLICKHOUSE_FLOW_STITCH_ENABLED=true` -- the processor stays inert (no table, no thread, no matching) until that flag is set, so it's safe to leave wired into the YAML across deployments where it isn't wanted yet. See `conf.example/envs/data_flow_stitching.env` for a sample configuration.
+
 ## ClickHouse Dictionary Settings
 
 Dictionaries provide fast lookup capabilities for metadata enrichment. Each metadata type can have its own dictionary configuration.

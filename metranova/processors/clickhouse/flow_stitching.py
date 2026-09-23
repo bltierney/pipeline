@@ -71,6 +71,11 @@ class FlowStitchingProcessor(BaseDataProcessor):
     def __init__(self, pipeline):
         super().__init__(pipeline)
 
+        # Off by default -- this changes what gets written to ClickHouse, so it should be
+        # an explicit opt-in per deployment rather than turning on the moment this
+        # processor is added to a pipeline YAML.
+        self.enabled = os.getenv("CLICKHOUSE_FLOW_STITCH_ENABLED", "false").lower() in ("true", "1", "yes")
+
         self.table = os.getenv("CLICKHOUSE_FLOW_STITCH_TABLE", "data_flow_anonymized")
         self.table_ttl = os.getenv("CLICKHOUSE_FLOW_STITCH_TTL", "5 YEAR")
         self.table_ttl_column = os.getenv("CLICKHOUSE_FLOW_STITCH_TTL_COLUMN", "start_time")
@@ -180,13 +185,29 @@ class FlowStitchingProcessor(BaseDataProcessor):
         self._lock = threading.Lock()
         self._flows: Dict[Tuple, Dict[str, Any]] = {}
 
-        self._sweep_thread = threading.Thread(
-            target=self._sweep_loop, name="FlowStitchingSweep", daemon=True
-        )
-        self._sweep_thread.start()
+        self._sweep_thread = None
+        if self.enabled:
+            self._sweep_thread = threading.Thread(
+                target=self._sweep_loop, name="FlowStitchingSweep", daemon=True
+            )
+            self._sweep_thread.start()
 
     def set_clickhouse_client(self, client) -> None:
         self._client = client
+
+    def match_message(self, value: dict) -> bool:
+        """Never match when disabled, so build_message() is never called and this
+        processor absorbs nothing -- the single CLICKHOUSE_FLOW_STITCH_ENABLED switch."""
+        if not self.enabled:
+            return False
+        return super().match_message(value)
+
+    def create_table_command(self, table_name=None) -> str:
+        """Skip creating the stitched-flow table entirely while disabled, same convention
+        ClickHouseBatcher already uses elsewhere (a None command means "nothing to do")."""
+        if not self.enabled:
+            return None
+        return super().create_table_command(table_name=table_name)
 
     def _fingerprint(self, row: Dict[str, Any]) -> Tuple:
         """Identifies 'the same flow' across export slices -- the usual 5-tuple plus
@@ -284,6 +305,10 @@ class FlowStitchingProcessor(BaseDataProcessor):
             self.logger.error(f"Flow stitching: failed to write completed flows to {self.table}: {e}")
 
     def build_message(self, value: dict, msg_metadata: dict) -> Iterator[Dict[str, Any]]:
+        # Belt-and-suspenders alongside match_message()'s False: never accumulate while
+        # disabled, even if something calls build_message() directly.
+        if not self.enabled:
+            return []
         try:
             slices = self._slice_processor.build_message(value, msg_metadata)
         except Exception as e:
