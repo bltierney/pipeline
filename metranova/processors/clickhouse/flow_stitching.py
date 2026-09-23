@@ -127,6 +127,11 @@ class FlowStitchingProcessor(BaseDataProcessor):
         self.column_defs.append(["flow_count", "UInt64", True])
         self.column_defs.append(["bit_count", "UInt64", True])
         self.column_defs.append(["packet_count", "UInt64", True])
+        # Average rates over the whole stitched flow -- same formula and 0-on-zero-duration
+        # fallback as the Logstash aggregate filter's packets_per_second/bits_per_second
+        # (40-aggregation.conf): integer-truncated count / duration.
+        self.column_defs.append(["packets_per_second", "UInt64", True])
+        self.column_defs.append(["bits_per_second", "UInt64", True])
 
         # Same extension shape as MaterializedViewAnonymizedFlow's ext column.
         extension_options = {
@@ -257,6 +262,14 @@ class FlowStitchingProcessor(BaseDataProcessor):
         row["bit_count"] = entry["bit_count"]
         row["packet_count"] = entry["packet_count"]
         row["flow_count"] = entry["stitched_flows"]
+        # Matches Logstash: (count / duration).to_i, or 0 if duration isn't positive
+        # (e.g. a single sample where start == end) rather than dividing by zero.
+        if row["duration"] > 0:
+            row["packets_per_second"] = int(row["packet_count"] / row["duration"])
+            row["bits_per_second"] = int(row["bit_count"] / row["duration"])
+        else:
+            row["packets_per_second"] = 0
+            row["bits_per_second"] = 0
 
         ip_version = row.get("ip_version", 4)
         row["src_ip"] = anonymize_ip(row.get("src_ip"), ip_version, self.anon_ipv4_prefix, self.anon_ipv6_prefix)
