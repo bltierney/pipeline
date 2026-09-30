@@ -1,6 +1,7 @@
 import ipaddress
 import logging
 import os
+import re
 import threading
 import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -9,6 +10,34 @@ from metranova.processors.clickhouse.base import BaseDataProcessor
 from metranova.processors.clickhouse.pmacct import PMAcctFlowProcessor
 
 logger = logging.getLogger(__name__)
+
+_BYTE_SIZE_MULTIPLIERS = {
+    "": 1, "b": 1,
+    "k": 1024, "kb": 1024,
+    "m": 1024 ** 2, "mb": 1024 ** 2,
+    "g": 1024 ** 3, "gb": 1024 ** 3,
+    "t": 1024 ** 4, "tb": 1024 ** 4,
+}
+
+_BYTE_SIZE_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([A-Za-z]*)\s*$")
+
+
+def parse_byte_size(value: Any) -> int:
+    """Parses a byte-size value into an integer number of bytes. Accepts a bare number
+    (int/float, or a numeric string with no suffix) or a string with a case-insensitive
+    binary-unit suffix -- K/KB, M/MB, G/GB, T/TB (1024-based, e.g. '10M' == 10*1024**2).
+    Used for CLICKHOUSE_FLOW_STITCH_MIN_BYTES so it can be set like '10M' instead of a
+    raw byte count."""
+    if isinstance(value, (int, float)):
+        return int(value)
+    match = _BYTE_SIZE_RE.match(str(value))
+    if not match:
+        raise ValueError(f"Invalid byte size: {value!r}")
+    number_str, suffix = match.groups()
+    multiplier = _BYTE_SIZE_MULTIPLIERS.get(suffix.lower())
+    if multiplier is None:
+        raise ValueError(f"Invalid byte size suffix in {value!r}: {suffix!r}")
+    return int(float(number_str) * multiplier)
 
 
 def anonymize_ip(
@@ -94,6 +123,12 @@ class FlowStitchingProcessor(BaseDataProcessor):
         # MaterializedViewAnonymizedFlow's CLICKHOUSE_FLOW_MV_ANONYMIZED_{WINDOW}_IPV{4,6}_PREFIX
         self.anon_ipv4_prefix = int(os.getenv("CLICKHOUSE_FLOW_STITCH_IPV4_PREFIX", "117"))
         self.anon_ipv6_prefix = int(os.getenv("CLICKHOUSE_FLOW_STITCH_IPV6_PREFIX", "48"))
+
+        # Drop completed flows smaller than this many bytes rather than writing them --
+        # 0 (default) disables filtering and keeps every flow, however small. Checked once
+        # the flow is complete (its final size isn't known any earlier), so a small flow
+        # still occupies an accumulator slot in memory until it times out/finishes.
+        self.min_bytes = parse_byte_size(os.getenv("CLICKHOUSE_FLOW_STITCH_MIN_BYTES", "0"))
 
         # start_time/end_time here are the real min/max event times of the whole stitched
         # flow (not bucketed) -- kept at full DateTime64(3, 'UTC') precision, same as data_flow.
@@ -282,6 +317,7 @@ class FlowStitchingProcessor(BaseDataProcessor):
     def _sweep_once(self) -> List[Dict[str, Any]]:
         now = time.time()
         completed = []
+        dropped_count = 0
         with self._lock:
             expired_fps = []
             for fp, entry in self._flows.items():
@@ -290,7 +326,19 @@ class FlowStitchingProcessor(BaseDataProcessor):
                 if idle_seconds >= self.inactivity_timeout or span_seconds >= self.max_flow_timeout:
                     expired_fps.append(fp)
             for fp in expired_fps:
-                completed.append(self._finalize(self._flows.pop(fp)))
+                row = self._finalize(self._flows.pop(fp))
+                # bit_count is in bits (see PMAcctFlowProcessor.build_message); compare in
+                # bytes against CLICKHOUSE_FLOW_STITCH_MIN_BYTES. self.min_bytes == 0 (the
+                # default) always passes, so nothing is filtered unless explicitly configured.
+                if row["bit_count"] // 8 < self.min_bytes:
+                    dropped_count += 1
+                    continue
+                completed.append(row)
+        if dropped_count:
+            self.logger.debug(
+                f"Flow stitching: dropped {dropped_count} completed flow(s) below "
+                f"CLICKHOUSE_FLOW_STITCH_MIN_BYTES={self.min_bytes} bytes"
+            )
         if completed:
             self._write_rows(completed)
         return completed

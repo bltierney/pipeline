@@ -139,7 +139,7 @@ The `ANONYMIZED` materialized view masks source, destination, and peer IP addres
 
 ## ClickHouse Flow Stitching
 
-`FlowStitchingProcessor` reconstructs full flow records from individual flow-cache export slices -- the netflow/sflow equivalent of Logstash's `aggregate` filter. Slices sharing the same fingerprint (device, source/destination IP and port, protocol, ingress/egress interface) are accumulated in memory and merged into a single record once the flow goes idle past `INACTIVITY_TIMEOUT` or exceeds `MAX_TIMEOUT`, rather than being written to ClickHouse as separate rows. A background sweep thread checks for idle/expired flows every `SWEEP_INTERVAL` seconds. Accumulator state is kept in memory only and any flow still accumulating at process restart is lost, not flushed.
+`FlowStitchingProcessor` reconstructs full flow records from individual flow-cache export slices -- the netflow/sflow equivalent of Logstash's `aggregate` filter. Slices sharing the same fingerprint (device, source/destination IP and port, protocol, ingress/egress interface) are accumulated in memory and merged into a single record once the flow goes idle past `INACTIVITY_TIMEOUT` or exceeds `MAX_TIMEOUT`, rather than being written to ClickHouse as separate rows. A background sweep thread checks for idle/expired flows every `SWEEP_INTERVAL` seconds. The stitched record also carries `packets_per_second` and `bits_per_second` -- integer-truncated averages over the full flow (`packet_count`/`duration` and `bit_count`/`duration`, or `0` when duration is `0`), matching Logstash's aggregate filter. Accumulator state is kept in memory only and any flow still accumulating at process restart is lost, not flushed.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -153,8 +153,9 @@ The `ANONYMIZED` materialized view masks source, destination, and peer IP addres
 | `CLICKHOUSE_FLOW_STITCH_SWEEP_INTERVAL` | `30` | Seconds between background sweeps that check for idle/expired flows |
 | `CLICKHOUSE_FLOW_STITCH_IPV4_PREFIX` | `117` | IPv6 prefix length (leading bits preserved) when masking IPv4 addresses in stitched records, same scheme as the [anonymized materialized views](#anonymized-materialized-view-ip-masking) |
 | `CLICKHOUSE_FLOW_STITCH_IPV6_PREFIX` | `48` | IPv6 prefix length (leading bits preserved) when masking IPv6 addresses in stitched records |
+| `CLICKHOUSE_FLOW_STITCH_MIN_BYTES` | `0` | Drop a completed flow instead of writing it if its total size is smaller than this many bytes. Accepts a bare byte count or a size with a binary-unit suffix (`K`/`KB`, `M`/`MB`, `G`/`GB`, `T`/`TB`, case-insensitive, 1024-based -- e.g. `10M`). `0` (default) keeps every flow, however small |
 
-`FlowStitchingProcessor` is not wired into a pipeline YAML by default. To use it, add `metranova.processors.clickhouse.flow_stitching.FlowStitchingProcessor` to a writer's `processors:` list, alongside `PMAcctFlowProcessor`, and set `CLICKHOUSE_FLOW_STITCH_ENABLED=true` -- the processor stays inert (no table, no thread, no matching) until that flag is set, so it's safe to leave wired into the YAML across deployments where it isn't wanted yet. See `conf.example/envs/data_flow_stitching.env` for a sample configuration.
+`FlowStitchingProcessor` is already wired into `pipelines/data_flow.yml`, alongside `PMAcctFlowProcessor`. It stays inert (no table, no thread, no matching) until `CLICKHOUSE_FLOW_STITCH_ENABLED=true` is set -- see `conf.example/envs/data_flow.env`, where these variables live alongside the rest of the flow pipeline's config. Compose only loads one pipeline-specific env file per pipeline (`PIPELINE_ENV_FILE`, alongside `base.env`), so these variables belong in that same file rather than a separate one that would never get loaded.
 
 ## ClickHouse Dictionary Settings
 

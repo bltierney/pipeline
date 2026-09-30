@@ -387,7 +387,7 @@ class MaterializedViewAnonymizedFlow(BaseClickHouseMaterializedViewMixin):
             raise ValueError("agg_window must be provided for MaterializedViewAnonymizedFlow")
         
         self.column_defs = [
-            ['start_time', "DateTime64(3, 'UTC')", True],
+            ['start_time', 'DateTime', True],
             ['end_time', "DateTime64(3, 'UTC')", True],
             ['duration', 'Float64', True],
             ['collector_id', 'LowCardinality(String)', True],
@@ -473,7 +473,7 @@ class MaterializedViewAnonymizedFlow(BaseClickHouseMaterializedViewMixin):
         self.anon_ipv4_prefix = int(os.getenv(f'CLICKHOUSE_FLOW_MV_ANONYMIZED_{agg_window_upper}_IPV4_PREFIX', '117'))
         self.anon_ipv6_prefix = int(os.getenv(f'CLICKHOUSE_FLOW_MV_ANONYMIZED_{agg_window_upper}_IPV6_PREFIX', '48'))
         self.table_engine = 'SummingMergeTree'
-        self.table_engine_opts = '(flow_count, bit_count, packet_count)'
+        self.table_engine_opts = '(flow_count, bit_count, packet_count, duration)'
         
         self.primary_keys = [
             "src_as_id",
@@ -534,9 +534,9 @@ class MaterializedViewAnonymizedFlow(BaseClickHouseMaterializedViewMixin):
 
         self.mv_select_query = f"""
             SELECT
-                start_time,
-                end_time,
-                dateDiff('millisecond', start_time, end_time) / 1000.0 AS duration,
+                toStartOfInterval(src.start_time, INTERVAL {self.agg_window_ch_interval}) AS start_time,
+                src.end_time AS end_time,
+                dateDiff('millisecond', src.start_time, src.end_time) / 1000.0 AS duration,
                 collector_id,
                 policy_originator,
                 {policy_level_term},
@@ -567,5 +567,5 @@ class MaterializedViewAnonymizedFlow(BaseClickHouseMaterializedViewMixin):
                 1 AS flow_count,
                 bit_count,
                 packet_count
-            FROM {self.source_table_name}
+            FROM {self.source_table_name} AS src
         """

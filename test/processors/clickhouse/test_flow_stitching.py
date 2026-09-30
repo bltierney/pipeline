@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 
-from metranova.processors.clickhouse.flow_stitching import FlowStitchingProcessor, anonymize_ip
+from metranova.processors.clickhouse.flow_stitching import FlowStitchingProcessor, anonymize_ip, parse_byte_size
 
 
 def make_slice(**overrides):
@@ -87,6 +87,47 @@ class TestAnonymizeIp(unittest.TestCase):
         self.assertEqual(anonymize_ip("not-an-ip", 4, 117, 48), "not-an-ip")
 
 
+class TestParseByteSize(unittest.TestCase):
+    def test_bare_int(self):
+        self.assertEqual(parse_byte_size(0), 0)
+        self.assertEqual(parse_byte_size(1500), 1500)
+
+    def test_numeric_string_no_suffix(self):
+        self.assertEqual(parse_byte_size("1500"), 1500)
+
+    def test_kilobytes(self):
+        self.assertEqual(parse_byte_size("10K"), 10 * 1024)
+        self.assertEqual(parse_byte_size("10KB"), 10 * 1024)
+        self.assertEqual(parse_byte_size("10kb"), 10 * 1024)
+
+    def test_megabytes(self):
+        self.assertEqual(parse_byte_size("10M"), 10 * 1024 ** 2)
+        self.assertEqual(parse_byte_size("10MB"), 10 * 1024 ** 2)
+
+    def test_gigabytes(self):
+        self.assertEqual(parse_byte_size("1G"), 1024 ** 3)
+
+    def test_terabytes(self):
+        self.assertEqual(parse_byte_size("1T"), 1024 ** 4)
+
+    def test_decimal_value_with_suffix(self):
+        self.assertEqual(parse_byte_size("1.5M"), int(1.5 * 1024 ** 2))
+
+    def test_whitespace_tolerated(self):
+        self.assertEqual(parse_byte_size(" 10 M "), 10 * 1024 ** 2)
+
+    def test_bare_b_suffix(self):
+        self.assertEqual(parse_byte_size("100b"), 100)
+
+    def test_invalid_suffix_raises(self):
+        with self.assertRaises(ValueError):
+            parse_byte_size("10X")
+
+    def test_garbage_raises(self):
+        with self.assertRaises(ValueError):
+            parse_byte_size("not-a-size")
+
+
 class TestFlowStitchingProcessor(unittest.TestCase):
     def setUp(self):
         self.mock_pipeline = MagicMock()
@@ -118,6 +159,8 @@ class TestFlowStitchingProcessor(unittest.TestCase):
         self.assertIn("`flow_count` UInt64", cmd)
         self.assertIn("`bit_count` UInt64", cmd)
         self.assertIn("`packet_count` UInt64", cmd)
+        self.assertIn("`packets_per_second` UInt64", cmd)
+        self.assertIn("`bits_per_second` UInt64", cmd)
         # no *_ip_ref passthrough columns -- this is the anonymized table, like data_flow_anonymized_5m
         self.assertNotIn("src_ip_ref", cmd)
 
@@ -177,8 +220,29 @@ class TestFlowStitchingProcessor(unittest.TestCase):
         self.assertEqual(row["bit_count"], 8000)
         self.assertEqual(row["packet_count"], 10)
         self.assertEqual(row["flow_count"], 1)
+        # int(8000 / 60.0) and int(10 / 60.0), matching Logstash's (count / duration).to_i
+        self.assertEqual(row["bits_per_second"], 133)
+        self.assertEqual(row["packets_per_second"], 0)
         # src_ip 192.0.2.10 anonymized to a /21 (default ipv4_prefix=117 -> 21 bits)
         self.assertEqual(row["src_ip"], "192.0.0.0")
+
+    def test_rates_are_zero_when_duration_is_zero(self):
+        # A single sample where start == end (duration 0) -- must not divide by zero,
+        # same as Logstash's "if duration > 0 ... else 0" branch.
+        self.processor.inactivity_timeout = 0.01
+        self.processor.max_flow_timeout = 86400
+        slice1 = make_slice(start_time=1_700_000_000_000, end_time=1_700_000_000_000)
+        self.mock_inner.build_message.return_value = [slice1]
+        self.processor.build_message({"raw": "msg"}, {})
+
+        time.sleep(0.05)
+        completed = self.processor._sweep_once()
+
+        self.assertEqual(len(completed), 1)
+        row = completed[0]
+        self.assertEqual(row["duration"], 0.0)
+        self.assertEqual(row["packets_per_second"], 0)
+        self.assertEqual(row["bits_per_second"], 0)
 
     def test_sweep_flushes_long_flow_even_without_inactivity(self):
         self.processor.inactivity_timeout = 86400  # long, shouldn't trigger
@@ -200,6 +264,47 @@ class TestFlowStitchingProcessor(unittest.TestCase):
         completed = self.processor._sweep_once()
         self.assertEqual(completed, [])
         self.assertEqual(len(self.processor._flows), 1)
+
+    def test_min_bytes_default_does_not_filter(self):
+        self.assertEqual(self.processor.min_bytes, 0)
+        self.processor.inactivity_timeout = 0.01
+        self.processor.max_flow_timeout = 86400
+        slice1 = make_slice(bit_count=8, packet_count=1)  # 1 byte -- tiny, but 0 disables filtering
+        self.mock_inner.build_message.return_value = [slice1]
+        self.processor.build_message({"raw": "msg"}, {})
+
+        time.sleep(0.05)
+        completed = self.processor._sweep_once()
+        self.assertEqual(len(completed), 1)
+
+    def test_min_bytes_drops_small_completed_flows(self):
+        self.processor.inactivity_timeout = 0.01
+        self.processor.max_flow_timeout = 86400
+        self.processor.min_bytes = 2000  # slice below has bit_count=8000 -> 1000 bytes
+        client = MagicMock()
+        self.processor.set_clickhouse_client(client)
+        slice1 = make_slice(bit_count=8000, packet_count=10)
+        self.mock_inner.build_message.return_value = [slice1]
+        self.processor.build_message({"raw": "msg"}, {})
+
+        time.sleep(0.05)
+        completed = self.processor._sweep_once()
+
+        self.assertEqual(completed, [])
+        self.assertEqual(len(self.processor._flows), 0)  # still removed from the accumulator
+        self.assertFalse(client.insert.called)  # and never written
+
+    def test_min_bytes_keeps_flows_at_or_above_threshold(self):
+        self.processor.inactivity_timeout = 0.01
+        self.processor.max_flow_timeout = 86400
+        self.processor.min_bytes = 1000  # slice below is exactly 1000 bytes -- not "smaller than"
+        slice1 = make_slice(bit_count=8000, packet_count=10)
+        self.mock_inner.build_message.return_value = [slice1]
+        self.processor.build_message({"raw": "msg"}, {})
+
+        time.sleep(0.05)
+        completed = self.processor._sweep_once()
+        self.assertEqual(len(completed), 1)
 
     def test_write_rows_uses_stored_client(self):
         client = MagicMock()
