@@ -1,3 +1,4 @@
+import hashlib
 import ipaddress
 import logging
 import os
@@ -141,6 +142,10 @@ class FlowStitchingProcessor(BaseDataProcessor):
         self.column_defs.insert(0, ["start_time", "DateTime64(3, 'UTC')", True])
         self.column_defs.insert(1, ["end_time", "DateTime64(3, 'UTC')", True])
         self.column_defs.insert(2, ["duration", "Float64", True])
+        # Stable hash of the flow fingerprint tuple (see _fingerprint()) -- lets
+        # downstream consumers group/join rows belonging to the same flow without
+        # reconstructing the tuple themselves.
+        self.column_defs.insert(3, ["flow_hash", "UInt64", True])
         self.column_defs.append(["flow_type", "LowCardinality(String)", True])
         self.column_defs.append(["device_id", "LowCardinality(String)", True])
         self.column_defs.append(["device_ref", "Nullable(String)", True])
@@ -269,6 +274,20 @@ class FlowStitchingProcessor(BaseDataProcessor):
             row.get("out_interface_id"),
         )
 
+    def _hash_fingerprint(self, fp: Tuple) -> int:
+        """Stable 64-bit hash of a flow fingerprint tuple, stored as flow_hash so
+        downstream consumers can group/join stitched rows on 'the same flow' without
+        reconstructing the fingerprint tuple themselves. Uses hashlib rather than
+        Python's built-in hash(), which salts string hashing per-process
+        (PYTHONHASHSEED) and would not be reproducible across restarts or between
+        multiple pipeline processes writing to the same table. Fields are joined with
+        an ASCII unit-separator character (rather than concatenated directly) so
+        different tuples can't collide at a field boundary, e.g. ("1", "23") vs
+        ("12", "3")."""
+        key = "\x1f".join("" if v is None else str(v) for v in fp)
+        digest = hashlib.sha256(key.encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "big")
+
     def _accumulate(self, fp: Tuple, row: Dict[str, Any]) -> None:
         """Must be called with self._lock held."""
         entry = self._flows.get(fp)
@@ -296,6 +315,10 @@ class FlowStitchingProcessor(BaseDataProcessor):
     def _finalize(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         """Builds the final stitched-flow row from an accumulator entry."""
         row = dict(entry["template"])
+        # Computed from the template's original (pre-anonymization) fields, before
+        # src_ip/dst_ip are masked below -- must match the same tuple _fingerprint()
+        # used to key this flow in self._flows while it was accumulating.
+        row["flow_hash"] = self._hash_fingerprint(self._fingerprint(row))
         row["start_time"] = entry["start_time"]
         row["end_time"] = entry["end_time"]
         # start_time/end_time are ms-since-epoch ints (see PMAcctFlowProcessor.build_message).

@@ -161,6 +161,7 @@ class TestFlowStitchingProcessor(unittest.TestCase):
         self.assertIn("`packet_count` UInt64", cmd)
         self.assertIn("`packets_per_second` UInt64", cmd)
         self.assertIn("`bits_per_second` UInt64", cmd)
+        self.assertIn("`flow_hash` UInt64", cmd)
         # no *_ip_ref passthrough columns -- this is the anonymized table, like data_flow_anonymized_5m
         self.assertNotIn("src_ip_ref", cmd)
 
@@ -223,6 +224,8 @@ class TestFlowStitchingProcessor(unittest.TestCase):
         # int(8000 / 60.0) and int(10 / 60.0), matching Logstash's (count / duration).to_i
         self.assertEqual(row["bits_per_second"], 133)
         self.assertEqual(row["packets_per_second"], 0)
+        self.assertIn("flow_hash", row)
+        self.assertIsInstance(row["flow_hash"], int)
         # src_ip 192.0.2.10 anonymized to a /21 (default ipv4_prefix=117 -> 21 bits)
         self.assertEqual(row["src_ip"], "192.0.0.0")
 
@@ -353,6 +356,76 @@ class TestFlowStitchingProcessor(unittest.TestCase):
         time.sleep(0.05)
         completed = self.processor._sweep_once()
         self.assertEqual(len(completed), 1)
+
+    def test_flow_hash_is_stable_for_the_same_fingerprint(self):
+        # Two otherwise-different finalize() calls sharing the same fingerprint fields
+        # (device/IPs/ports/protocol/interfaces) must produce the same flow_hash --
+        # it identifies "the same flow", not a particular set of slices.
+        row1 = self.processor._finalize({
+            "template": make_slice(),
+            "start_time": 1_700_000_000_000,
+            "end_time": 1_700_000_060_000,
+            "bit_count": 8000,
+            "packet_count": 10,
+            "stitched_flows": 1,
+        })
+        row2 = self.processor._finalize({
+            "template": make_slice(),
+            "start_time": 1_700_000_100_000,
+            "end_time": 1_700_000_160_000,
+            "bit_count": 500,
+            "packet_count": 2,
+            "stitched_flows": 1,
+        })
+        self.assertIsInstance(row1["flow_hash"], int)
+        self.assertEqual(row1["flow_hash"], row2["flow_hash"])
+
+    def test_flow_hash_differs_for_different_fingerprints(self):
+        row_a = self.processor._finalize({
+            "template": make_slice(src_port=443),
+            "start_time": 1_700_000_000_000,
+            "end_time": 1_700_000_060_000,
+            "bit_count": 8000,
+            "packet_count": 10,
+            "stitched_flows": 1,
+        })
+        row_b = self.processor._finalize({
+            "template": make_slice(src_port=8443),
+            "start_time": 1_700_000_000_000,
+            "end_time": 1_700_000_060_000,
+            "bit_count": 8000,
+            "packet_count": 10,
+            "stitched_flows": 1,
+        })
+        self.assertNotEqual(row_a["flow_hash"], row_b["flow_hash"])
+
+    def test_flow_hash_fits_in_uint64(self):
+        row = self.processor._finalize({
+            "template": make_slice(),
+            "start_time": 1_700_000_000_000,
+            "end_time": 1_700_000_060_000,
+            "bit_count": 8000,
+            "packet_count": 10,
+            "stitched_flows": 1,
+        })
+        self.assertGreaterEqual(row["flow_hash"], 0)
+        self.assertLess(row["flow_hash"], 2 ** 64)
+
+    def test_hash_fingerprint_is_deterministic_across_instances(self):
+        # Not process/instance specific (unlike Python's built-in hash() for strings) --
+        # two independently-constructed processors must agree on the same fingerprint.
+        fp = ("router1", "192.0.2.10", 443, "198.51.100.20", 51000, "tcp", "eth0", "eth1")
+        other = FlowStitchingProcessor.__new__(FlowStitchingProcessor)
+        self.assertEqual(self.processor._hash_fingerprint(fp), other._hash_fingerprint(fp))
+
+    def test_hash_fingerprint_avoids_field_boundary_collisions(self):
+        h1 = self.processor._hash_fingerprint(("1", "23", None))
+        h2 = self.processor._hash_fingerprint(("12", "3", None))
+        self.assertNotEqual(h1, h2)
+
+    def test_hash_fingerprint_handles_none_values(self):
+        h = self.processor._hash_fingerprint((None, "a", None))
+        self.assertIsInstance(h, int)
 
     def test_write_rows_uses_stored_client(self):
         client = MagicMock()
