@@ -228,9 +228,11 @@ class TestFlowStitchingProcessor(unittest.TestCase):
 
     def test_rates_are_zero_when_duration_is_zero(self):
         # A single sample where start == end (duration 0) -- must not divide by zero,
-        # same as Logstash's "if duration > 0 ... else 0" branch.
+        # same as Logstash's "if duration > 0 ... else 0" branch. Disable the min_duration
+        # filter (default 0.1s would otherwise drop this flow before we can inspect it).
         self.processor.inactivity_timeout = 0.01
         self.processor.max_flow_timeout = 86400
+        self.processor.min_duration = 0
         slice1 = make_slice(start_time=1_700_000_000_000, end_time=1_700_000_000_000)
         self.mock_inner.build_message.return_value = [slice1]
         self.processor.build_message({"raw": "msg"}, {})
@@ -299,6 +301,52 @@ class TestFlowStitchingProcessor(unittest.TestCase):
         self.processor.max_flow_timeout = 86400
         self.processor.min_bytes = 1000  # slice below is exactly 1000 bytes -- not "smaller than"
         slice1 = make_slice(bit_count=8000, packet_count=10)
+        self.mock_inner.build_message.return_value = [slice1]
+        self.processor.build_message({"raw": "msg"}, {})
+
+        time.sleep(0.05)
+        completed = self.processor._sweep_once()
+        self.assertEqual(len(completed), 1)
+
+    def test_min_duration_default_is_point_one_second(self):
+        self.assertEqual(self.processor.min_duration, 0.1)
+
+    def test_min_duration_drops_flows_at_or_below_threshold(self):
+        # duration <= min_duration is dropped ("<=", not "<") -- a flow exactly at the
+        # default 0.1s threshold should be dropped, not kept.
+        self.processor.inactivity_timeout = 0.01
+        self.processor.max_flow_timeout = 86400
+        client = MagicMock()
+        self.processor.set_clickhouse_client(client)
+        slice1 = make_slice(start_time=1_700_000_000_000, end_time=1_700_000_000_100)  # 0.1s
+        self.mock_inner.build_message.return_value = [slice1]
+        self.processor.build_message({"raw": "msg"}, {})
+
+        time.sleep(0.05)
+        completed = self.processor._sweep_once()
+
+        self.assertEqual(completed, [])
+        self.assertEqual(len(self.processor._flows), 0)
+        self.assertFalse(client.insert.called)
+
+    def test_min_duration_keeps_flows_above_threshold(self):
+        self.processor.inactivity_timeout = 0.01
+        self.processor.max_flow_timeout = 86400
+        slice1 = make_slice(start_time=1_700_000_000_000, end_time=1_700_000_000_101)  # 0.101s
+        self.mock_inner.build_message.return_value = [slice1]
+        self.processor.build_message({"raw": "msg"}, {})
+
+        time.sleep(0.05)
+        completed = self.processor._sweep_once()
+        self.assertEqual(len(completed), 1)
+
+    def test_min_duration_disabled_with_zero(self):
+        # 0 disables the filter entirely, same "0 means off" convention as
+        # CLICKHOUSE_FLOW_STITCH_MIN_BYTES -- even a literal duration-0 flow passes.
+        self.processor.inactivity_timeout = 0.01
+        self.processor.max_flow_timeout = 86400
+        self.processor.min_duration = 0
+        slice1 = make_slice(start_time=1_700_000_000_000, end_time=1_700_000_000_000)  # 0s
         self.mock_inner.build_message.return_value = [slice1]
         self.processor.build_message({"raw": "msg"}, {})
 

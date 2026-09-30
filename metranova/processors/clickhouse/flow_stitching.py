@@ -130,6 +130,12 @@ class FlowStitchingProcessor(BaseDataProcessor):
         # still occupies an accumulator slot in memory until it times out/finishes.
         self.min_bytes = parse_byte_size(os.getenv("CLICKHOUSE_FLOW_STITCH_MIN_BYTES", "0"))
 
+        # Drop completed flows whose duration is <= this many seconds -- filters out
+        # single-sample/near-instant flows (a lone probe packet, a single netflow
+        # sample with no measurable span) that are rarely useful for bitrate analysis.
+        # Defaults to 0.1s rather than 0, unlike CLICKHOUSE_FLOW_STITCH_MIN_BYTES.
+        self.min_duration = float(os.getenv("CLICKHOUSE_FLOW_STITCH_MIN_DURATION", "0.1"))
+
         # start_time/end_time here are the real min/max event times of the whole stitched
         # flow (not bucketed) -- kept at full DateTime64(3, 'UTC') precision, same as data_flow.
         self.column_defs.insert(0, ["start_time", "DateTime64(3, 'UTC')", True])
@@ -317,7 +323,8 @@ class FlowStitchingProcessor(BaseDataProcessor):
     def _sweep_once(self) -> List[Dict[str, Any]]:
         now = time.time()
         completed = []
-        dropped_count = 0
+        dropped_bytes = 0
+        dropped_duration = 0
         with self._lock:
             expired_fps = []
             for fp, entry in self._flows.items():
@@ -331,13 +338,25 @@ class FlowStitchingProcessor(BaseDataProcessor):
                 # bytes against CLICKHOUSE_FLOW_STITCH_MIN_BYTES. self.min_bytes == 0 (the
                 # default) always passes, so nothing is filtered unless explicitly configured.
                 if row["bit_count"] // 8 < self.min_bytes:
-                    dropped_count += 1
+                    dropped_bytes += 1
+                    continue
+                # duration <= CLICKHOUSE_FLOW_STITCH_MIN_DURATION (default 0.1s) filters
+                # out single-sample/near-instant flows. min_duration <= 0 disables this
+                # filter entirely (including for a literal duration-0 flow), same
+                # "0 means off" convention as CLICKHOUSE_FLOW_STITCH_MIN_BYTES.
+                if self.min_duration > 0 and row["duration"] <= self.min_duration:
+                    dropped_duration += 1
                     continue
                 completed.append(row)
-        if dropped_count:
+        if dropped_bytes:
             self.logger.debug(
-                f"Flow stitching: dropped {dropped_count} completed flow(s) below "
+                f"Flow stitching: dropped {dropped_bytes} completed flow(s) below "
                 f"CLICKHOUSE_FLOW_STITCH_MIN_BYTES={self.min_bytes} bytes"
+            )
+        if dropped_duration:
+            self.logger.debug(
+                f"Flow stitching: dropped {dropped_duration} completed flow(s) with "
+                f"duration <= CLICKHOUSE_FLOW_STITCH_MIN_DURATION={self.min_duration}s"
             )
         if completed:
             self._write_rows(completed)
