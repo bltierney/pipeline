@@ -42,7 +42,8 @@ class TestCommunityRegistryProcessor(unittest.TestCase):
             self.assertIn('`organization_id` LowCardinality(Nullable(String))', result)
             self.assertIn('`organization_ref` Nullable(String)', result)
             self.assertIn('`community` LowCardinality(Nullable(String))', result)
-            self.assertIn('`asn` Nullable(UInt32)', result)
+            self.assertIn('`as_id` Nullable(UInt32)', result)
+            self.assertIn('`as_ref` Nullable(String)', result)
             self.assertIn('`notes` Nullable(String)', result)
 
     def test_create_table_command_default_table_name(self):
@@ -77,7 +78,7 @@ class TestCommunityRegistryProcessor(unittest.TestCase):
 
         self.assertEqual(record["organization_name"], "Santa Rosa Community College")
         self.assertEqual(record["community"], "CENIC")
-        self.assertEqual(record["asn"], 2152)
+        self.assertEqual(record["as_id"], 2152)
         self.assertEqual(record["notes"], "test note")
 
     def test_build_message_missing_prefix_length(self):
@@ -198,7 +199,7 @@ class TestCommunityRegistryProcessor(unittest.TestCase):
         result = processor.build_message(input_data, {})
         record = result[0]
 
-        self.assertIsNone(record["asn"])
+        self.assertIsNone(record["as_id"])
 
     def test_organization_id_mapping_no_cache_match(self):
         """organization_id falls back to org_name when there's no cache match."""
@@ -260,6 +261,85 @@ class TestCommunityRegistryProcessor(unittest.TestCase):
         processor.build_message(input_data, {})
 
         self.mock_clickhouse_cacher.lookup.assert_any_call("meta_organization:name", "Test College")
+
+    def test_as_ref_no_cache_match(self):
+        """as_ref is None when there's no cache match for the AS number."""
+        processor = CommunityRegistryProcessor(self.mock_pipeline)
+
+        input_data = {
+            "data": [
+                {
+                    "community_id": "test123",
+                    "addresses": ["198.189.140.0/24"],
+                    "asn": "2152"
+                }
+            ]
+        }
+        result = processor.build_message(input_data, {})
+        record = result[0]
+
+        self.assertEqual(record["as_id"], 2152)
+        self.assertIsNone(record["as_ref"])
+
+    def test_as_ref_cache_match(self):
+        """as_ref resolves from the clickhouse cacher when there's a match, keyed by as_id."""
+        processor = CommunityRegistryProcessor(self.mock_pipeline)
+        self.mock_clickhouse_cacher.lookup.side_effect = lambda table, key: (
+            {"id": 2152, "ref": "meta_as:2152__v3", "hash": "abc"}
+            if table == "meta_as" and key == 2152
+            else None
+        )
+
+        input_data = {
+            "data": [
+                {
+                    "community_id": "test123",
+                    "addresses": ["198.189.140.0/24"],
+                    "asn": "2152"
+                }
+            ]
+        }
+        result = processor.build_message(input_data, {})
+        record = result[0]
+
+        self.assertEqual(record["as_id"], 2152)
+        self.assertEqual(record["as_ref"], "meta_as:2152__v3")
+
+    def test_clickhouse_cacher_lookup_for_as(self):
+        """AS lookup goes through the clickhouse cacher, keyed directly by the (int) AS number."""
+        processor = CommunityRegistryProcessor(self.mock_pipeline)
+
+        input_data = {
+            "data": [
+                {
+                    "community_id": "test123",
+                    "addresses": ["198.189.140.0/24"],
+                    "asn": "2152"
+                }
+            ]
+        }
+        processor.build_message(input_data, {})
+
+        self.mock_clickhouse_cacher.lookup.assert_any_call("meta_as", 2152)
+
+    def test_as_ref_none_when_as_id_missing(self):
+        """No asn in the input -> as_id is None, and the cacher is still queried with None
+        (same pattern as organization_id/organization_ref with a missing org_name)."""
+        processor = CommunityRegistryProcessor(self.mock_pipeline)
+
+        input_data = {
+            "data": [
+                {
+                    "community_id": "test123",
+                    "addresses": ["198.189.140.0/24"]
+                }
+            ]
+        }
+        result = processor.build_message(input_data, {})
+        record = result[0]
+
+        self.assertIsNone(record["as_id"])
+        self.assertIsNone(record["as_ref"])
 
     def test_build_message_missing_required_fields(self):
         """Test build_message with missing required fields."""
