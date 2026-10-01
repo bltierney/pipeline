@@ -40,7 +40,8 @@ class CommunityRegistryProcessor(BaseMetadataProcessor):
             ['organization_id', 'LowCardinality(Nullable(String))', True],
             ['organization_ref', 'Nullable(String)', True],
             ['community', 'LowCardinality(Nullable(String))', True],
-            ['asn', 'Nullable(UInt32)', True],
+            ['as_id', 'Nullable(UInt32)', True],
+            ['as_ref', 'Nullable(String)', True],
             ['notes', 'Nullable(String)', True]
         ])
         self.required_fields = [
@@ -114,7 +115,7 @@ class CommunityRegistryProcessor(BaseMetadataProcessor):
             'ip_subnet': ip_subnets,
             'organization_name': org_name,
             'community': value.get('community', None),
-            'asn': value.get('asn', None),
+            'as_id': value.get('asn', None),
             'notes': value.get('notes', None),
             'ext': '{}',
             'tag': []
@@ -134,12 +135,24 @@ class CommunityRegistryProcessor(BaseMetadataProcessor):
             formatted_record["organization_id"] = org_name
             formatted_record["organization_ref"] = None
 
-        #cast asn to an int, and set to None if exception when casting
-        if formatted_record['asn'] is not None:
+        #cast as_id to an int, and set to None if exception when casting
+        if formatted_record['as_id'] is not None:
             try:
-                formatted_record['asn'] = int(formatted_record['asn'])
+                formatted_record['as_id'] = int(formatted_record['as_id'])
             except ValueError:
-                formatted_record['asn'] = None
+                formatted_record['as_id'] = None
+
+        # Resolve as_ref via the clickhouse cacher, same pattern as
+        # IPMetadataProcessor -- meta_as is keyed directly by AS number, unlike
+        # meta_organization above which needs the 'table:field' composite-key
+        # form since it's keyed by name.
+        # NOTE: this requires 'meta_as' to be listed in the CLICKHOUSE_CACHER_TABLES
+        # env var for this pipeline.
+        cached_as_info = self.pipeline.cacher("clickhouse").lookup("meta_as", formatted_record['as_id'])
+        if cached_as_info:
+            formatted_record["as_ref"] = cached_as_info.get(self.db_ref_field, None)
+        else:
+            formatted_record["as_ref"] = None
 
         return formatted_record
 
