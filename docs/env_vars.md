@@ -144,7 +144,7 @@ The `ANONYMIZED` materialized view masks source, destination, and peer IP addres
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CLICKHOUSE_FLOW_STITCH_ENABLED` | `false` | Master on/off switch. Off by default: when `false`, this processor never matches a message, creates no table, and starts no background sweep thread |
-| `CLICKHOUSE_FLOW_STITCH_TABLE` | `data_flow_anonymized` | Table for completed, stitched flow records |
+| `CLICKHOUSE_FLOW_STITCH_TABLE` | `data_flow_stitched` | Table for completed, stitched flow records |
 | `CLICKHOUSE_FLOW_STITCH_TTL` | `5 YEAR` | TTL for the stitched flow table |
 | `CLICKHOUSE_FLOW_STITCH_TTL_COLUMN` | `start_time` | Column to use for TTL calculation |
 | `CLICKHOUSE_FLOW_STITCH_PARTITION_BY` | `toYYYYMMDD(start_time)` | Partition expression for the stitched flow table |

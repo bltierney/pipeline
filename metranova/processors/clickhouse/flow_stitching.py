@@ -106,7 +106,7 @@ class FlowStitchingProcessor(BaseDataProcessor):
         # processor is added to a pipeline YAML.
         self.enabled = os.getenv("CLICKHOUSE_FLOW_STITCH_ENABLED", "false").lower() in ("true", "1", "yes")
 
-        self.table = os.getenv("CLICKHOUSE_FLOW_STITCH_TABLE", "data_flow_anonymized")
+        self.table = os.getenv("CLICKHOUSE_FLOW_STITCH_TABLE", "data_flow_stitched")
         self.table_ttl = os.getenv("CLICKHOUSE_FLOW_STITCH_TTL", "5 YEAR")
         self.table_ttl_column = os.getenv("CLICKHOUSE_FLOW_STITCH_TTL_COLUMN", "start_time")
         self.partition_by = os.getenv(

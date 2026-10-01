@@ -145,13 +145,13 @@ class TestFlowStitchingProcessor(unittest.TestCase):
         self.processor.sweep_interval = 10_000  # effectively never fires on its own during tests
 
     def test_table_defaults(self):
-        self.assertEqual(self.processor.table, "data_flow_anonymized")
+        self.assertEqual(self.processor.table, "data_flow_stitched")
         self.assertEqual(self.processor.table_engine, "MergeTree")
         self.assertEqual(self.processor.table_engine_opts, "")
 
     def test_create_table_command_has_expected_columns(self):
         cmd = self.processor.create_table_command()
-        self.assertIn("CREATE TABLE IF NOT EXISTS data_flow_anonymized", cmd)
+        self.assertIn("CREATE TABLE IF NOT EXISTS data_flow_stitched", cmd)
         self.assertIn("ENGINE = MergeTree()", cmd)
         self.assertIn("`start_time` DateTime64(3, 'UTC')", cmd)
         self.assertIn("`end_time` DateTime64(3, 'UTC')", cmd)
@@ -441,7 +441,7 @@ class TestFlowStitchingProcessor(unittest.TestCase):
         self.processor._write_rows([row])
         self.assertTrue(client.insert.called)
         _, kwargs = client.insert.call_args
-        self.assertEqual(kwargs["table"], "data_flow_anonymized")
+        self.assertEqual(kwargs["table"], "data_flow_stitched")
 
     def test_write_rows_without_client_does_not_raise(self):
         row = self.processor._finalize({
@@ -495,7 +495,7 @@ class TestFlowStitchingEnabledFlag(unittest.TestCase):
         self.assertTrue(processor._sweep_thread.is_alive())
         self.assertTrue(processor.match_message({"raw": "msg"}))
         self.assertIn(
-            "CREATE TABLE IF NOT EXISTS data_flow_anonymized",
+            "CREATE TABLE IF NOT EXISTS data_flow_stitched",
             processor.create_table_command(),
         )
 
