@@ -229,6 +229,37 @@ class TestFlowStitchingProcessor(unittest.TestCase):
         # src_ip 192.0.2.10 anonymized to a /21 (default ipv4_prefix=117 -> 21 bits)
         self.assertEqual(row["src_ip"], "192.0.0.0")
 
+    def test_anonymize_defaults_to_true(self):
+        self.assertTrue(self.processor.anonymize)
+
+    def test_anonymize_disabled_leaves_ips_unmasked(self):
+        self.processor.anonymize = False
+        self.processor.inactivity_timeout = 0.01
+        self.processor.max_flow_timeout = 86400
+        slice1 = make_slice()
+        self.mock_inner.build_message.return_value = [slice1]
+        self.processor.build_message({"raw": "msg"}, {})
+
+        time.sleep(0.05)
+        completed = self.processor._sweep_once()
+
+        self.assertEqual(len(completed), 1)
+        row = completed[0]
+        self.assertEqual(row["src_ip"], "192.0.2.10")
+        self.assertEqual(row["dst_ip"], "198.51.100.20")
+
+    def test_anonymize_env_var_accepts_no(self):
+        with patch.dict(os.environ, {"CLICKHOUSE_FLOW_STITCH_ENABLED": "true", "CLICKHOUSE_FLOW_STITCH_ANONYMIZE": "no"}), \
+             patch("metranova.processors.clickhouse.flow_stitching.PMAcctFlowProcessor"):
+            processor = FlowStitchingProcessor(MagicMock())
+        self.assertFalse(processor.anonymize)
+
+    def test_anonymize_env_var_accepts_yes(self):
+        with patch.dict(os.environ, {"CLICKHOUSE_FLOW_STITCH_ENABLED": "true", "CLICKHOUSE_FLOW_STITCH_ANONYMIZE": "yes"}), \
+             patch("metranova.processors.clickhouse.flow_stitching.PMAcctFlowProcessor"):
+            processor = FlowStitchingProcessor(MagicMock())
+        self.assertTrue(processor.anonymize)
+
     def test_rates_are_zero_when_duration_is_zero(self):
         # A single sample where start == end (duration 0) -- must not divide by zero,
         # same as Logstash's "if duration > 0 ... else 0" branch. Disable the min_duration

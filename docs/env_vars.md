@@ -151,8 +151,9 @@ The `ANONYMIZED` materialized view masks source, destination, and peer IP addres
 | `CLICKHOUSE_FLOW_STITCH_INACTIVITY_TIMEOUT` | `630` | Seconds of wall-clock inactivity before an in-progress flow is flushed as complete |
 | `CLICKHOUSE_FLOW_STITCH_MAX_TIMEOUT` | `86400` | Maximum flow duration in seconds (event-time span between first and last slice); flows exceeding this are flushed even while still active |
 | `CLICKHOUSE_FLOW_STITCH_SWEEP_INTERVAL` | `30` | Seconds between background sweeps that check for idle/expired flows |
-| `CLICKHOUSE_FLOW_STITCH_IPV4_PREFIX` | `117` | IPv6 prefix length (leading bits preserved) when masking IPv4 addresses in stitched records, same scheme as the [anonymized materialized views](#anonymized-materialized-view-ip-masking) |
-| `CLICKHOUSE_FLOW_STITCH_IPV6_PREFIX` | `48` | IPv6 prefix length (leading bits preserved) when masking IPv6 addresses in stitched records |
+| `CLICKHOUSE_FLOW_STITCH_ANONYMIZE` | `yes` | Whether to anonymize `src_ip`/`dst_ip`/`peer_ip` in stitched records (masking host bits per the prefix lengths below). `yes` by default, matching this processor's original behavior; set to `no` to write full, unmasked addresses instead |
+| `CLICKHOUSE_FLOW_STITCH_IPV4_PREFIX` | `117` | IPv6 prefix length (leading bits preserved) when masking IPv4 addresses in stitched records, same scheme as the [anonymized materialized views](#anonymized-materialized-view-ip-masking). Has no effect when `CLICKHOUSE_FLOW_STITCH_ANONYMIZE=no` |
+| `CLICKHOUSE_FLOW_STITCH_IPV6_PREFIX` | `48` | IPv6 prefix length (leading bits preserved) when masking IPv6 addresses in stitched records. Has no effect when `CLICKHOUSE_FLOW_STITCH_ANONYMIZE=no` |
 | `CLICKHOUSE_FLOW_STITCH_MIN_BYTES` | `0` | Drop a completed flow instead of writing it if its total size is smaller than this many bytes. Accepts a bare byte count or a size with a binary-unit suffix (`K`/`KB`, `M`/`MB`, `G`/`GB`, `T`/`TB`, case-insensitive, 1024-based -- e.g. `10M`). `0` (default) keeps every flow, however small |
 | `CLICKHOUSE_FLOW_STITCH_MIN_DURATION` | `0.1` | Drop a completed flow instead of writing it if its duration (seconds) is less than or equal to this value. Filters out single-sample/near-instant flows. `0` (or negative) disables this filter entirely, including for a literal duration-0 flow |
 

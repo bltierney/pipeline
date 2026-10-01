@@ -120,6 +120,12 @@ class FlowStitchingProcessor(BaseDataProcessor):
         self.max_flow_timeout = float(os.getenv("CLICKHOUSE_FLOW_STITCH_MAX_TIMEOUT", "86400"))
         self.sweep_interval = float(os.getenv("CLICKHOUSE_FLOW_STITCH_SWEEP_INTERVAL", "30"))
 
+        # Anonymize src_ip/dst_ip/peer_ip in stitched records by masking host bits
+        # down to anon_ipv4_prefix/anon_ipv6_prefix below. On by default, matching this
+        # processor's original always-anonymized behavior -- set to "no" to write full,
+        # unmasked addresses instead.
+        self.anonymize = os.getenv("CLICKHOUSE_FLOW_STITCH_ANONYMIZE", "yes").lower() in ("true", "1", "yes")
+
         # IP anonymization prefix lengths -- same meaning/defaults as
         # MaterializedViewAnonymizedFlow's CLICKHOUSE_FLOW_MV_ANONYMIZED_{WINDOW}_IPV{4,6}_PREFIX
         self.anon_ipv4_prefix = int(os.getenv("CLICKHOUSE_FLOW_STITCH_IPV4_PREFIX", "117"))
@@ -335,11 +341,12 @@ class FlowStitchingProcessor(BaseDataProcessor):
             row["packets_per_second"] = 0
             row["bits_per_second"] = 0
 
-        ip_version = row.get("ip_version", 4)
-        row["src_ip"] = anonymize_ip(row.get("src_ip"), ip_version, self.anon_ipv4_prefix, self.anon_ipv6_prefix)
-        row["dst_ip"] = anonymize_ip(row.get("dst_ip"), ip_version, self.anon_ipv4_prefix, self.anon_ipv6_prefix)
-        if row.get("peer_ip"):
-            row["peer_ip"] = anonymize_ip(row.get("peer_ip"), ip_version, self.anon_ipv4_prefix, self.anon_ipv6_prefix)
+        if self.anonymize:
+            ip_version = row.get("ip_version", 4)
+            row["src_ip"] = anonymize_ip(row.get("src_ip"), ip_version, self.anon_ipv4_prefix, self.anon_ipv6_prefix)
+            row["dst_ip"] = anonymize_ip(row.get("dst_ip"), ip_version, self.anon_ipv4_prefix, self.anon_ipv6_prefix)
+            if row.get("peer_ip"):
+                row["peer_ip"] = anonymize_ip(row.get("peer_ip"), ip_version, self.anon_ipv4_prefix, self.anon_ipv6_prefix)
 
         return row
 
