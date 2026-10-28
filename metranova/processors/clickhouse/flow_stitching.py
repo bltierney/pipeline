@@ -242,12 +242,21 @@ class FlowStitchingProcessor(BaseDataProcessor):
         self._lock = threading.Lock()
         self._flows: Dict[Tuple, Dict[str, Any]] = {}
 
+        self._sweep_count = 0
+
         self._sweep_thread = None
         if self.enabled:
+            logger.info(
+                "Flow stitching: enabled (table=%s, sweep_interval=%ss, "
+                "inactivity_timeout=%ss, max_flow_timeout=%ss)",
+                self.table, self.sweep_interval, self.inactivity_timeout, self.max_flow_timeout,
+            )
             self._sweep_thread = threading.Thread(
                 target=self._sweep_loop, name="FlowStitchingSweep", daemon=True
             )
             self._sweep_thread.start()
+        else:
+            logger.info("Flow stitching: disabled (CLICKHOUSE_FLOW_STITCH_ENABLED is not true)")
 
     def set_clickhouse_client(self, client) -> None:
         self._client = client
@@ -368,6 +377,13 @@ class FlowStitchingProcessor(BaseDataProcessor):
                 # bytes against CLICKHOUSE_FLOW_STITCH_MIN_BYTES. self.min_bytes == 0 (the
                 # default) always passes, so nothing is filtered unless explicitly configured.
                 if row["bit_count"] // 8 < self.min_bytes:
+                    self.logger.debug(
+                        "Flow stitching: dropping flow: below CLICKHOUSE_FLOW_STITCH_MIN_BYTES=%d "
+                        "bytes (src=%s:%s dst=%s:%s proto=%s bytes=%d duration=%.3fs flow_count=%d)",
+                        self.min_bytes, row.get("src_ip"), row.get("src_port"),
+                        row.get("dst_ip"), row.get("dst_port"), row.get("protocol"),
+                        row["bit_count"] // 8, row["duration"], row.get("flow_count", 0),
+                    )
                     dropped_bytes += 1
                     continue
                 # duration <= CLICKHOUSE_FLOW_STITCH_MIN_DURATION (default 0.1s) filters
@@ -375,6 +391,14 @@ class FlowStitchingProcessor(BaseDataProcessor):
                 # filter entirely (including for a literal duration-0 flow), same
                 # "0 means off" convention as CLICKHOUSE_FLOW_STITCH_MIN_BYTES.
                 if self.min_duration > 0 and row["duration"] <= self.min_duration:
+                    self.logger.debug(
+                        "Flow stitching: dropping flow: duration %.3fs <= "
+                        "CLICKHOUSE_FLOW_STITCH_MIN_DURATION=%.3fs (src=%s:%s dst=%s:%s proto=%s "
+                        "bytes=%d flow_count=%d)",
+                        row["duration"], self.min_duration, row.get("src_ip"), row.get("src_port"),
+                        row.get("dst_ip"), row.get("dst_port"), row.get("protocol"),
+                        row["bit_count"] // 8, row.get("flow_count", 0),
+                    )
                     dropped_duration += 1
                     continue
                 completed.append(row)
@@ -393,12 +417,23 @@ class FlowStitchingProcessor(BaseDataProcessor):
         return completed
 
     def _sweep_loop(self) -> None:
+        self.logger.info("Flow stitching: sweep thread started")
         while True:
             time.sleep(self.sweep_interval)
             try:
-                self._sweep_once()
+                completed = self._sweep_once()
+                self._sweep_count += 1
+                with self._lock:
+                    in_flight = len(self._flows)
+                # DEBUG only -- fires every sweep_interval forever, so it's not
+                # something production logging should carry at INFO by default. Set
+                # DEBUG=true (see docs/env_vars.md) to watch this live.
+                self.logger.debug(
+                    "Flow stitching: sweep #%d, %d flow(s) in-flight, %d completed this tick",
+                    self._sweep_count, in_flight, len(completed),
+                )
             except Exception as e:
-                self.logger.error(f"Flow stitching sweep failed: {e}")
+                self.logger.error(f"Flow stitching sweep failed: {e}", exc_info=True)
 
     def _write_rows(self, rows: List[Dict[str, Any]]) -> None:
         if self._client is None:
@@ -412,7 +447,7 @@ class FlowStitchingProcessor(BaseDataProcessor):
             self._client.insert(table=self.table, data=data, column_names=self.column_names(self.table))
             self.logger.info(f"Flow stitching: wrote {len(rows)} completed flow(s) to {self.table}")
         except Exception as e:
-            self.logger.error(f"Flow stitching: failed to write completed flows to {self.table}: {e}")
+            self.logger.error(f"Flow stitching: failed to write completed flows to {self.table}: {e}", exc_info=True)
 
     def build_message(self, value: dict, msg_metadata: dict) -> Iterator[Dict[str, Any]]:
         # Belt-and-suspenders alongside match_message()'s False: never accumulate while
@@ -422,13 +457,18 @@ class FlowStitchingProcessor(BaseDataProcessor):
         try:
             slices = self._slice_processor.build_message(value, msg_metadata)
         except Exception as e:
-            self.logger.error(f"Flow stitching: failed to normalize incoming message: {e}")
+            self.logger.error(f"Flow stitching: failed to normalize incoming message: {e}", exc_info=True)
             return []
         if not slices:
             return []
         with self._lock:
             for slice_row in slices:
                 self._accumulate(self._fingerprint(slice_row), slice_row)
+            in_flight = len(self._flows)
+        self.logger.debug(
+            "Flow stitching: absorbed %d slice(s), %d flow(s) now in-flight",
+            len(slices), in_flight,
+        )
         # Completed flows are written directly to ClickHouse by the background sweep
         # thread (_sweep_loop), not returned here -- every incoming slice is absorbed.
         return []
