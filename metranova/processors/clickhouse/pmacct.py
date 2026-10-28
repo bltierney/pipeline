@@ -282,6 +282,14 @@ class PMAcctFlowProcessor(BaseFlowProcessor):
     def build_message(self, value: dict, msg_metadata: dict) -> Iterator[Dict[str, Any]]:
         # check required fields
         if not self.has_required_fields(value):
+            # has_required_fields() already logged which field at ERROR -- this just
+            # tags it with the common "Dropping flow:" prefix other drop reasons use,
+            # so grepping for that phrase finds every drop reason in one place.
+            self.logger.debug(
+                "Dropping flow: missing required field(s) (see preceding error for which field; "
+                "raw keys=%s)",
+                sorted(value.keys()) if isinstance(value, dict) else type(value).__name__,
+            )
             return None
         #check time fields:
         # - nfacctd will have timestamp_start and timestamp_end
@@ -292,7 +300,11 @@ class PMAcctFlowProcessor(BaseFlowProcessor):
             value["timestamp_end"] = value["timestamp_arrival"]
         elif value.get("timestamp_start", None) is None:
             # if no start (and already checked for arrival), then we can't process this record
-            self.logger.debug("Missing timestamp fields in flow record")
+            self.logger.debug(
+                "Dropping flow: missing timestamp fields (src=%s:%s dst=%s:%s proto=%s)",
+                value.get("ip_src"), value.get("port_src"),
+                value.get("ip_dst"), value.get("port_dst"), value.get("ip_proto"),
+            )
             return None
         elif value.get("timestamp_end", None) is None:
             #just in case end is not specified, set it to start - probably should not happen
@@ -316,13 +328,25 @@ class PMAcctFlowProcessor(BaseFlowProcessor):
         # [meta][dst_asn] (and the equivalent src_asn check), just run here
         # instead, as early as possible, before any further lookups/extension
         # building happen for a flow we're going to discard anyway.
+        #
+        # NOTE: an earlier version of this code gave AS_TRANS (23456) special
+        # treatment -- only dropping when BOTH sides hit it, on the theory that
+        # a single AS_TRANS endpoint usually means a real ASN that just didn't
+        # resolve via BGP. In practice that let through more unwanted traffic
+        # than intended, so it's back to treating AS_TRANS the same as every
+        # other value in is_reserved_asn(): a reserved/private/unknown ASN on
+        # either side alone is enough to drop.
+        src_as_id = formatted_record.get("src_as_id")
+        dst_as_id = formatted_record.get("dst_as_id")
         if self.drop_reserved_asn and (
-            self.is_reserved_asn(formatted_record.get("src_as_id"))
-            or self.is_reserved_asn(formatted_record.get("dst_as_id"))
+            self.is_reserved_asn(src_as_id)
+            or self.is_reserved_asn(dst_as_id)
         ):
             self.logger.debug(
-                "Dropping flow with reserved/invalid ASN (src_as_id=%s, dst_as_id=%s)",
-                formatted_record.get("src_as_id"), formatted_record.get("dst_as_id")
+                "Dropping flow: reserved/invalid ASN (src=%s:%s as_id=%s, dst=%s:%s as_id=%s, proto=%s)",
+                formatted_record.get("src_ip"), value.get("port_src"), formatted_record.get("src_as_id"),
+                formatted_record.get("dst_ip"), value.get("port_dst"), formatted_record.get("dst_as_id"),
+                value.get("ip_proto"),
             )
             return None
 
@@ -361,7 +385,13 @@ class PMAcctFlowProcessor(BaseFlowProcessor):
             start_time = int(float(value.get("timestamp_start", 0)) * 1000)
             end_time = int(float(value.get("timestamp_end", 0)) * 1000)
         except (ValueError, TypeError):
-            self.logger.debug("Invalid timestamp format in flow record")
+            self.logger.debug(
+                "Dropping flow: invalid timestamp format (src=%s:%s dst=%s:%s proto=%s "
+                "timestamp_start=%r timestamp_end=%r)",
+                formatted_record.get("src_ip"), src_port,
+                formatted_record.get("dst_ip"), dst_port, value.get("ip_proto"),
+                value.get("timestamp_start"), value.get("timestamp_end"),
+            )
             return None
 
         # Build extension fields

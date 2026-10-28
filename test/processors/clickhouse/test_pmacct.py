@@ -958,8 +958,21 @@ class TestPMAcctFlowProcessorReservedAsnFilter(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_build_message_dropped_when_dst_asn_as_trans(self):
-        """Equivalent of the Logstash filter's [meta][dst_asn] == 23456 check."""
+        """Equivalent of the Logstash filter's [meta][dst_asn] == 23456 check.
+        AS_TRANS is treated the same as every other reserved value: either side
+        alone is enough to drop (an earlier version special-cased AS_TRANS to
+        only drop when BOTH sides hit it, but that let through more unwanted
+        traffic than intended, so it's back to this simpler rule)."""
         result = self._enabled_processor().build_message(self._base_value(7922, 23456), {})
+        self.assertIsNone(result)
+
+    def test_build_message_dropped_when_src_asn_as_trans(self):
+        """Same as above, but AS_TRANS on the src side instead of dst."""
+        result = self._enabled_processor().build_message(self._base_value(23456, 32093), {})
+        self.assertIsNone(result)
+
+    def test_build_message_dropped_when_both_asns_as_trans(self):
+        result = self._enabled_processor().build_message(self._base_value(23456, 23456), {})
         self.assertIsNone(result)
 
     def test_build_message_dropped_when_dst_asn_16bit_private_use(self):
