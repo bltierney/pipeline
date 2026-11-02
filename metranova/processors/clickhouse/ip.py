@@ -125,8 +125,8 @@ class IPGeoPrefixMaterializedView(BaseClickHouseMaterializedViewMixin):
                 coalesce(country_code, '') AS country_code,
                 coalesce(country_sub_name, '') AS country_sub_name,
                 coalesce(country_sub_code, '') AS country_sub_code,
-                coalesce(latitude, nan()) AS latitude,
-                coalesce(longitude, nan()) AS longitude,
+                coalesce(latitude, nan) AS latitude,
+                coalesce(longitude, nan) AS longitude,
                 coalesce(as_id, 0) AS as_id,
                 coalesce(as_ref, '') AS as_ref,
                 id

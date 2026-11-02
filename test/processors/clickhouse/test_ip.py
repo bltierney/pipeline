@@ -709,8 +709,8 @@ class TestIPGeoPrefixMaterializedView(unittest.TestCase):
 
         self.assertIn("coalesce(city_name, '') AS city_name", mv.mv_select_query)
         self.assertIn("coalesce(country_name, '') AS country_name", mv.mv_select_query)
-        self.assertIn("coalesce(latitude, nan()) AS latitude", mv.mv_select_query)
-        self.assertIn("coalesce(longitude, nan()) AS longitude", mv.mv_select_query)
+        self.assertIn("coalesce(latitude, nan) AS latitude", mv.mv_select_query)
+        self.assertIn("coalesce(longitude, nan) AS longitude", mv.mv_select_query)
         self.assertIn("coalesce(as_id, 0) AS as_id", mv.mv_select_query)
         self.assertIn("coalesce(as_ref, '') AS as_ref", mv.mv_select_query)
 
