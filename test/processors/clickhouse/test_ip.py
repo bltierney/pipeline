@@ -738,8 +738,8 @@ class TestIPGeoDictionary(unittest.TestCase):
             ['country_code', "String DEFAULT ''"],
             ['country_sub_name', "String DEFAULT ''"],
             ['country_sub_code', "String DEFAULT ''"],
-            ['latitude', "Float64 DEFAULT nan()"],
-            ['longitude', "Float64 DEFAULT nan()"],
+            ['latitude', "Float64 DEFAULT nan"],
+            ['longitude', "Float64 DEFAULT nan"],
             ['as_id', "UInt32 DEFAULT 0"],
             ['as_ref', "String DEFAULT ''"],
         ]
