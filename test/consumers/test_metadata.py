@@ -1811,6 +1811,84 @@ class TestCAIDAOrgASConsumerURLFunctionality(unittest.TestCase):
         expected_url = 'https://publicdata.caida.org/datasets/peeringdb/2025/12/peeringdb_2_dump_2025_12_15.json'
         self.assertEqual(url, expected_url)
 
+    def test_get_caida_as2org_index_url(self):
+        """Test _get_caida_as2org_index_url strips the '{date}...' filename
+        portion, leaving just the directory URL."""
+        self.assertEqual(
+            self.consumer._get_caida_as2org_index_url(),
+            'https://publicdata.caida.org/datasets/as-organizations/'
+        )
+
+    @patch.object(CAIDAOrgASConsumer, '_download_file_with_fallback')
+    def test_discover_latest_caida_as2org_url_picks_newest(self, mock_download):
+        """Test _discover_latest_caida_as2org_url scrapes the directory listing
+        and picks the lexicographically (== chronologically, for YYYYMMDD names)
+        newest matching file, ignoring unrelated links."""
+        mock_download.return_value = b"""
+        <html><body>
+        <a href="20260901.as-org2info.jsonl.gz">20260901.as-org2info.jsonl.gz</a>
+        <a href="20261001.as-org2info.jsonl.gz">20261001.as-org2info.jsonl.gz</a>
+        <a href="unrelated-file.txt">unrelated-file.txt</a>
+        </body></html>
+        """
+
+        url = self.consumer._discover_latest_caida_as2org_url()
+
+        self.assertEqual(
+            url,
+            'https://publicdata.caida.org/datasets/as-organizations/20261001.as-org2info.jsonl.gz'
+        )
+        mock_download.assert_called_once_with(
+            'https://publicdata.caida.org/datasets/as-organizations/', max_retries=1
+        )
+
+    @patch.object(CAIDAOrgASConsumer, '_download_file_with_fallback', return_value=None)
+    def test_discover_latest_caida_as2org_url_index_unreachable(self, mock_download):
+        """Test _discover_latest_caida_as2org_url returns None (not raise) when
+        the directory listing itself can't be fetched."""
+        self.assertIsNone(self.consumer._discover_latest_caida_as2org_url())
+
+    @patch.object(CAIDAOrgASConsumer, '_download_file_with_fallback')
+    def test_discover_latest_caida_as2org_url_no_matches(self, mock_download):
+        """Test _discover_latest_caida_as2org_url returns None when the listing
+        has no file matching the expected naming pattern."""
+        mock_download.return_value = b"<html><body>nothing relevant here</body></html>"
+        self.assertIsNone(self.consumer._discover_latest_caida_as2org_url())
+
+    @patch.object(CAIDAOrgASConsumer, '_discover_latest_caida_as2org_url')
+    @patch.object(CAIDAOrgASConsumer, '_download_file_with_fallback')
+    @patch('gzip.decompress')
+    def test_fetch_caida_data_from_url_prefers_discovered_file(
+        self, mock_decompress, mock_download, mock_discover
+    ):
+        """Test _fetch_caida_data_from_url uses the discovered URL directly,
+        without ever falling through to the guessed-date loop."""
+        discovered_url = 'https://publicdata.caida.org/datasets/as-organizations/20261015.as-org2info.jsonl.gz'
+        mock_discover.return_value = discovered_url
+        mock_download.return_value = b'compressed data'
+        mock_decompress.return_value = b'{"type": "Organization", "organizationId": "org1"}'
+
+        result = self.consumer._fetch_caida_data_from_url()
+
+        self.assertEqual(result, '{"type": "Organization", "organizationId": "org1"}')
+        mock_download.assert_called_once_with(discovered_url)
+
+    @patch.object(CAIDAOrgASConsumer, '_discover_latest_caida_as2org_url', return_value=None)
+    @patch('requests.get')
+    def test_fetch_caida_data_from_url_logs_warning_when_discovery_fails(self, mock_get, mock_discover):
+        """Test _fetch_caida_data_from_url logs a warning (not an error) when
+        discovery fails, before falling back to the guessed-date loop."""
+        mock_response = Mock()
+        mock_response.status_code = 404
+        mock_get.return_value = mock_response
+
+        with patch.object(self.consumer.logger, 'warning') as mock_warning:
+            self.consumer._fetch_caida_data_from_url()
+            self.assertTrue(
+                any('Could not discover latest CAIDA AS2Org file' in call[0][0]
+                    for call in mock_warning.call_args_list)
+            )
+
     @patch('requests.get')
     def test_download_file_with_fallback_success(self, mock_get):
         """Test _download_file_with_fallback with successful download."""
@@ -1863,9 +1941,10 @@ class TestCAIDAOrgASConsumerURLFunctionality(unittest.TestCase):
             self.assertIsNone(result)
             self.assertEqual(mock_get.call_count, 2)
 
+    @patch.object(CAIDAOrgASConsumer, '_discover_latest_caida_as2org_url', return_value=None)
     @patch('requests.get')
     @patch('gzip.decompress')
-    def test_fetch_caida_data_from_url_success(self, mock_decompress, mock_get):
+    def test_fetch_caida_data_from_url_success(self, mock_decompress, mock_get, mock_discover):
         """Test _fetch_caida_data_from_url with successful download and decompression."""
         compressed_data = b'compressed data'
         decompressed_data = b'{"type": "Organization", "organizationId": "org1"}'
@@ -1882,8 +1961,9 @@ class TestCAIDAOrgASConsumerURLFunctionality(unittest.TestCase):
         self.assertEqual(result, decompressed_data.decode('utf-8'))
         mock_decompress.assert_called_once_with(compressed_data)
 
+    @patch.object(CAIDAOrgASConsumer, '_discover_latest_caida_as2org_url', return_value=None)
     @patch('requests.get')
-    def test_fetch_caida_data_from_url_fallback_to_previous_month(self, mock_get):
+    def test_fetch_caida_data_from_url_fallback_to_previous_month(self, mock_get, mock_discover):
         """Test _fetch_caida_data_from_url falls back to previous month."""
         # First call returns 404, second call succeeds
         mock_response_404 = Mock()
@@ -1903,8 +1983,9 @@ class TestCAIDAOrgASConsumerURLFunctionality(unittest.TestCase):
             # Should try twice (current month and previous month)
             self.assertEqual(mock_get.call_count, 2)
 
+    @patch.object(CAIDAOrgASConsumer, '_discover_latest_caida_as2org_url', return_value=None)
     @patch('requests.get')
-    def test_fetch_caida_data_from_url_all_attempts_fail(self, mock_get):
+    def test_fetch_caida_data_from_url_all_attempts_fail(self, mock_get, mock_discover):
         """Test _fetch_caida_data_from_url when all attempts fail."""
         mock_response = Mock()
         mock_response.status_code = 404
@@ -1916,9 +1997,10 @@ class TestCAIDAOrgASConsumerURLFunctionality(unittest.TestCase):
             self.assertIsNone(result)
             self.assertIn('Failed to fetch CAIDA AS2Org data', mock_error.call_args[0][0])
 
+    @patch.object(CAIDAOrgASConsumer, '_discover_latest_caida_as2org_url', return_value=None)
     @patch('requests.get')
     @patch('gzip.decompress')
-    def test_fetch_caida_data_from_url_decompression_error(self, mock_decompress, mock_get):
+    def test_fetch_caida_data_from_url_decompression_error(self, mock_decompress, mock_get, mock_discover):
         """Test _fetch_caida_data_from_url handles decompression errors."""
         mock_response = Mock()
         mock_response.status_code = 200
