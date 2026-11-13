@@ -116,18 +116,7 @@ class CAIDAOrgASConsumer(TimedIntervalConsumer):
         """Generate CAIDA AS2Org URL for a given date"""
         date_str = date.strftime('%Y%m%d')
         return self.as2org_url_template.format(date=date_str)
-
-    def _get_caida_as2org_latest_url(self):
-        """CAIDA publishes a stable 'latest.as-org2info.jsonl.gz' alias
-        alongside each dated snapshot, always pointing at whichever file is
-        currently newest. Preferred over guessing a date
-        (_fetch_caida_data_from_url()'s fallback below): it doesn't depend
-        on CAIDA publishing on the 1st of the month, or on this pipeline's
-        clock agreeing with when CAIDA actually published. Not documented on
-        CAIDA's own catalog page, but confirmed reachable in practice."""
-        index_url = self.as2org_url_template.split('{date}')[0]
-        return index_url + 'latest.as-org2info.jsonl.gz'
-
+    
     def _get_peeringdb_url(self, date):
         """Generate PeeringDB URL for a given date"""
         return self.peeringdb_url_template.format(
@@ -137,23 +126,14 @@ class CAIDAOrgASConsumer(TimedIntervalConsumer):
         )
     
     def _fetch_caida_data_from_url(self):
-        """Fetch CAIDA AS2Org data from URL. Prefers CAIDA's stable
-        'latest.as-org2info.jsonl.gz' alias; falls back to guessing the
-        current/previous month's 1st-of-month filename only if that alias
-        is ever unreachable or goes away."""
-        urls_to_try = [self._get_caida_as2org_latest_url()]
-
-        # Guessed current/previous month filenames, as a last-resort
-        # fallback -- skip any that happen to already match the alias URL.
+        """Fetch CAIDA AS2Org data from URL with monthly fallback"""
         now = datetime.now()
+        # Try current month (1st day) first, then previous month
         for months_back in range(2):
             target_date = (now.replace(day=1) - timedelta(days=months_back * 30)).replace(day=1)
-            guessed_url = self._get_caida_as2org_url(target_date)
-            if guessed_url not in urls_to_try:
-                urls_to_try.append(guessed_url)
-
-        for url in urls_to_try:
+            url = self._get_caida_as2org_url(target_date)
             self.logger.info(f"Attempting to download CAIDA AS2Org data from {url}")
+            
             content = self._download_file_with_fallback(url)
             if content:
                 try:
@@ -162,8 +142,8 @@ class CAIDAOrgASConsumer(TimedIntervalConsumer):
                     return decompressed.decode('utf-8')
                 except Exception as e:
                     self.logger.error(f"Error decompressing CAIDA data from {url}: {e}")
-
-        self.logger.error("Failed to fetch CAIDA AS2Org data from URL after trying the latest alias and guessed filenames")
+        
+        self.logger.error("Failed to fetch CAIDA AS2Org data from URL after trying current and previous month")
         return None
     
     def _fetch_peeringdb_data_from_url(self):
@@ -213,17 +193,12 @@ class CAIDAOrgASConsumer(TimedIntervalConsumer):
             self.logger.error("No CAIDA AS2Org data available to process")
             return
         
-        org_count = 0
-        asn_count = 0
-        asn_dropped = 0
-        asn_name_defaulted = 0
         try:
             for line in data_content.splitlines():
                 if not line.strip():
                     continue
                 line_json = orjson.loads(line)
                 if line_json.get('type') == 'Organization':
-                    org_count += 1
                     if line_json.get('organizationId', None) is None:
                         continue
                     org_id = f"caida:{line_json['organizationId']}"
@@ -241,47 +216,18 @@ class CAIDAOrgASConsumer(TimedIntervalConsumer):
                         if continent_name:
                             org_objs[org_id]['continent_name'] = continent_name
                 elif line_json.get('type') == 'ASN':
-                    asn_count += 1
-                    if line_json.get('asn', None) is None or line_json.get('organizationId', None) is None:
-                        asn_dropped += 1
-                        self.logger.warning(
-                            f"CAIDA AS2Org: dropping ASN record missing asn or "
-                            f"organizationId: {line_json}"
-                        )
+                    if line_json.get('asn', None) is None or line_json.get('organizationId', None) is None or line_json.get('name', None) is None:
                         continue
                     try:
                         as_id = int(line_json['asn'])
                     except ValueError:
-                        asn_dropped += 1
-                        self.logger.warning(
-                            f"CAIDA AS2Org: dropping ASN record with non-numeric "
-                            f"asn: {line_json}"
-                        )
                         continue
-                    # Some CAIDA records (observed for a handful of legacy/RIPE-
-                    # region ASNs, e.g. AS1110) carry an organizationId but no
-                    # 'name' key at all. Don't drop the whole record over that --
-                    # the organization linkage is still good and resolves to a real
-                    # org name via organization_id/organization_ref. Default the
-                    # AS's own name instead, the same way the Organization branch
-                    # above defaults to "Delegated" rather than dropping.
-                    as_name = line_json.get('name', None)
-                    if not as_name:
-                        asn_name_defaulted += 1
-                        as_name = f"AS{as_id}"
                     as_objs[as_id] = {
                         'id': as_id,
                         'organization_id': f"caida:{line_json['organizationId']}",
-                        'name': as_name,
+                        'name': line_json.get('name', None),
                         'ext': {"data_source": ["CAIDA"]}
                     }
-            self.logger.info(
-                f"CAIDA AS2Org: parsed {org_count} organization record(s) and "
-                f"{asn_count} ASN record(s); {asn_dropped} ASN record(s) dropped "
-                f"(missing/invalid asn or organizationId), {asn_name_defaulted} "
-                f"ASN record(s) had no name in the source data and were given a "
-                f"default of 'AS<number>'"
-            )
         except Exception as e:
             self.logger.error(f"Error processing CAIDA AS2Org data: {e}")
 
