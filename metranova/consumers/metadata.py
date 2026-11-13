@@ -760,10 +760,24 @@ class IPGeolocationCSVConsumer(TimedIntervalConsumer):
 
     def _process_ip_block_files(self, ip_to_asn_trie, location_code_map, custom_ip_data):
         """Process IP block files and emit IP objects to pipeline.
-        Returns tuple of (custom_ip_data, processed_networks_set)
+        Returns tuple of (custom_ip_data, processed_networks_trie).
+
+        processed_networks_trie is a pytricia trie (not a plain set) keyed by
+        every City-block network, so _process_remaining_asn_ranges() below can
+        ask a real subnet-containment question -- "is this ASN-only network
+        already covered by some City block, even a broader one?" -- instead
+        of an exact CIDR-string match. MaxMind's ASN file and City file don't
+        partition address space along the same boundaries, so a narrower
+        ASN-only block (e.g. 128.182.64.0/18) can sit entirely inside a
+        broader City block (e.g. 128.182.0.0/16) without its CIDR string ever
+        matching exactly -- an exact-string check would miss that and let the
+        narrower, location-less ASN-only row get added, which then wins any
+        IP_TRIE lookup inside that range (longest-prefix-match always prefers
+        it over the broader, complete City-block row), leaving country/city
+        blank for every IP in it.
         """
         # CSV Column names: network,geoname_id,registered_country_geoname_id,represented_country_geoname_id,is_anonymous_proxy,is_satellite_provider,postal_code,latitude,longitude,accuracy_radius,is_anycast
-        processed_networks = set()  # Track networks processed from City blocks
+        processed_networks = pytricia.PyTricia(128)  # Track networks processed from City blocks (v4 + v6)
         
         for ip_block_file in self.ip_block_files:
             try:
@@ -772,7 +786,7 @@ class IPGeolocationCSVConsumer(TimedIntervalConsumer):
                     for row in reader:
                         ip_obj, custom_ip_data = self._build_ip_object(row, ip_to_asn_trie, location_code_map, custom_ip_data)
                         if ip_obj:
-                            processed_networks.add(ip_obj['id'])  # Track this network
+                            processed_networks[ip_obj['id']] = True  # Track this network
                             # Process the record - do this here to avoid memory issues with large files
                             # TODO: Possibly speed up imports by batching records instead of one at a time
                             self.pipeline.process_message({'table': self.table, 'data': [ip_obj]})
@@ -785,8 +799,13 @@ class IPGeolocationCSVConsumer(TimedIntervalConsumer):
 
     def _process_remaining_asn_ranges(self, processed_networks, location_code_map, custom_ip_data):
         """Process ASN ranges that don't have corresponding City blocks.
-        Only adds ASN ranges whose network ID is not already in processed_networks.
-        This ensures ASN-only ranges don't overwrite City blocks with better data.
+        Only adds ASN ranges not already covered by an entry in
+        processed_networks (a pytricia trie -- see _process_ip_block_files()
+        above -- so this is a true subnet-containment check, not an exact
+        CIDR-string match: an ASN-only range that sits inside a broader City
+        block is skipped even though its own CIDR string never appears in
+        the City-block file). This ensures ASN-only ranges don't shadow City
+        blocks with better data.
         """
         asn_only_count = 0
         

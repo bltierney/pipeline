@@ -7,6 +7,7 @@ import orjson
 import json
 import csv
 import gzip
+import pytricia
 from io import StringIO
 from datetime import datetime, timedelta
 
@@ -1130,7 +1131,7 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
         
         mock_error.assert_called_once()
         self.assertEqual(remaining_custom, {})
-        self.assertEqual(processed_networks, set())
+        self.assertEqual(len(processed_networks), 0)
 
     @patch('builtins.open', new_callable=mock_open)
     def test_process_ip_block_files_empty_network_skip(self, mock_file):
@@ -1147,6 +1148,44 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
         # Should only process one message (the row with valid network)
         self.assertEqual(self.mock_pipeline.process_message.call_count, 1)
         self.assertEqual(len(processed_networks), 1)
+
+    @patch('builtins.open', new_callable=mock_open)
+    def test_process_remaining_asn_ranges_skips_range_contained_in_city_block(self, mock_file):
+        """An ASN-only range that sits entirely inside a broader City block
+        (e.g. 128.182.64.0/18 inside 128.182.0.0/16) must be skipped even
+        though its own CIDR string never appears in processed_networks --
+        processed_networks is a pytricia trie, so this is a real
+        subnet-containment check, not an exact string match. Otherwise this
+        narrower, location-less row would get added and win any later
+        IP_TRIE lookup over the broader, complete City-block row."""
+        asn_csv = "network,autonomous_system_number\n128.182.64.0/18,12345"
+        mock_file.return_value = StringIO(asn_csv)
+        self.consumer.asn_files = ['/test/asn1.csv']
+
+        processed_networks = pytricia.PyTricia(128)
+        processed_networks['128.182.0.0/16'] = True  # broader City block
+
+        self.consumer._process_remaining_asn_ranges(processed_networks, {}, {})
+
+        self.mock_pipeline.process_message.assert_not_called()
+
+    @patch('builtins.open', new_callable=mock_open)
+    def test_process_remaining_asn_ranges_adds_range_not_covered_by_city_block(self, mock_file):
+        """An ASN-only range with no covering City block at all (broader,
+        narrower, or otherwise) must still be added."""
+        asn_csv = "network,autonomous_system_number\n169.228.0.0/17,8517"
+        mock_file.return_value = StringIO(asn_csv)
+        self.consumer.asn_files = ['/test/asn1.csv']
+
+        processed_networks = pytricia.PyTricia(128)
+        processed_networks['10.0.0.0/8'] = True  # unrelated City block
+
+        self.consumer._process_remaining_asn_ranges(processed_networks, {}, {})
+
+        self.mock_pipeline.process_message.assert_called_once()
+        call_data = self.mock_pipeline.process_message.call_args[0][0]['data'][0]
+        self.assertEqual(call_data['id'], '169.228.0.0/17')
+        self.assertEqual(call_data['as_id'], 8517)
 
     @patch.object(IPGeolocationCSVConsumer, '_process_remaining_asn_ranges')
     @patch.object(IPGeolocationCSVConsumer, '_process_ip_block_files')
@@ -1208,14 +1247,8 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
         self.mock_pipeline.process_message.assert_not_called()
 
     @patch('builtins.open', new_callable=mock_open)
-    @patch('pytricia.PyTricia')
-    def test_consume_messages_asn_files(self, mock_pytricia, mock_file):
+    def test_consume_messages_asn_files(self, mock_file):
         """Test consume_messages processing ASN files."""
-        # Mock PyTricia instance with proper dictionary-like behavior
-        mock_trie = Mock()
-        mock_trie.__setitem__ = Mock()
-        mock_pytricia.return_value = mock_trie
-        
         # Mock ASN CSV data
         asn_csv_data = """network,autonomous_system_number,autonomous_system_organization
 192.168.1.0/24,65001,Test AS 1
@@ -1236,10 +1269,15 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
                 with patch.object(self.consumer, 'custom_ip_file', None):
                     self.consumer.consume_messages()
         
-        # Verify PyTricia was initialized and populated
-        mock_pytricia.assert_called_once_with(128)
-        # Verify that the trie was accessed correctly (through __setitem__)
-        self.assertEqual(len(mock_trie.__setitem__.call_args_list), 4)  # 2 files × 2 rows each
+        # With no City blocks at all, both rows of both configured ASN files
+        # (/test/asn1.csv and /test/asn2.csv, each serving the same 2-row
+        # CSV above) are added via _process_remaining_asn_ranges, since
+        # processed_networks is empty -- nothing is "already covered".
+        calls = self.mock_pipeline.process_message.call_args_list
+        self.assertEqual(len(calls), 4)
+        seen = [(c[0][0]['data'][0]['id'], c[0][0]['data'][0]['as_id']) for c in calls]
+        self.assertEqual(seen.count(('192.168.1.0/24', 65001)), 2)
+        self.assertEqual(seen.count(('10.0.0.0/8', 65002)), 2)
 
     @patch('builtins.open', new_callable=mock_open)
     def test_consume_messages_location_files(self, mock_file):
@@ -1297,23 +1335,17 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
 192.168.1.0/24,123456,123456,,0,0,94105,37.7749,-122.4194,1000,0
 10.0.0.0/8,789012,789012,,0,0,75001,48.8566,2.3522,1000,0"""
         
-        # Mock PyTricia and location mapping
-        with patch('pytricia.PyTricia') as mock_pytricia:
-            mock_trie = Mock()
-            mock_trie.get.return_value = 65001  # Mock ASN lookup
-            mock_pytricia.return_value = mock_trie
-            
-            # Create a side effect function that returns different CSV data for different calls
-            def mock_file_side_effect(*args, **kwargs):
-                return StringIO(ip_block_csv_data)
-            
-            mock_file.side_effect = mock_file_side_effect
-            
-            # Mock other components
-            with patch.object(self.consumer, 'asn_files', []):
-                with patch.object(self.consumer, 'location_files', []):
-                    with patch.object(self.consumer, 'custom_ip_file', None):
-                        self.consumer.consume_messages()
+        # Create a side effect function that returns different CSV data for different calls
+        def mock_file_side_effect(*args, **kwargs):
+            return StringIO(ip_block_csv_data)
+        
+        mock_file.side_effect = mock_file_side_effect
+        
+        # Mock other components
+        with patch.object(self.consumer, 'asn_files', []):
+            with patch.object(self.consumer, 'location_files', []):
+                with patch.object(self.consumer, 'custom_ip_file', None):
+                    self.consumer.consume_messages()
         
         # Verify process_message was called for each IP block row
         self.assertTrue(self.mock_pipeline.process_message.called)
@@ -1346,14 +1378,8 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
         self.assertTrue(mock_error.called)
 
     @patch('builtins.open', new_callable=mock_open)
-    @patch('pytricia.PyTricia')
-    def test_consume_messages_integration(self, mock_pytricia, mock_file):
+    def test_consume_messages_integration(self, mock_file):
         """Test consume_messages integration with all components."""
-        mock_trie = Mock()
-        mock_trie.__setitem__ = Mock()
-        mock_trie.get.return_value = 65001
-        mock_pytricia.return_value = mock_trie
-        
         # Mock ASN data
         asn_csv = """network,autonomous_system_number,autonomous_system_organization
 192.168.1.0/24,65001,Test AS"""
@@ -1391,9 +1417,6 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
         
         # Verify that process_message was called
         self.assertTrue(self.mock_pipeline.process_message.called)
-        
-        # Verify PyTricia operations
-        mock_pytricia.assert_called_once_with(128)
 
     def test_consumer_without_custom_file(self):
         """Test consumer initialization without custom IP file."""
@@ -1404,12 +1427,8 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
             self.assertEqual(consumer.custom_ip_file, '')
 
     @patch('builtins.open', new_callable=mock_open)
-    @patch('pytricia.PyTricia')
-    def test_consume_messages_empty_network_skip(self, mock_pytricia, mock_file):
+    def test_consume_messages_empty_network_skip(self, mock_file):
         """Test that rows with empty network values are skipped."""
-        mock_trie = Mock()
-        mock_pytricia.return_value = mock_trie
-        
         # IP block data with empty network
         ip_block_csv = """network,geoname_id,latitude,longitude
 ,123456,37.7749,-122.4194
@@ -1434,13 +1453,8 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
         self.assertEqual(self.mock_pipeline.process_message.call_count, 1)
 
     @patch('builtins.open', new_callable=mock_open)
-    @patch('pytricia.PyTricia')
-    def test_ip_subnet_conversion_in_consume_messages(self, mock_pytricia, mock_file):
+    def test_ip_subnet_conversion_in_consume_messages(self, mock_file):
         """Test that IP subnet conversion works correctly during consume_messages."""
-        mock_trie = Mock()
-        mock_trie.get.return_value = None  # No ASN found
-        mock_pytricia.return_value = mock_trie
-        
         # IP block data
         ip_block_csv = """network,geoname_id,latitude,longitude
 192.168.1.0/24,123456,37.7749,-122.4194"""
