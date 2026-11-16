@@ -7,11 +7,11 @@ import orjson
 import json
 import csv
 import gzip
-import pytricia
 from io import StringIO
 from datetime import datetime, timedelta
 
 from metranova.consumers.metadata import YAMLFileConsumer, CAIDAOrgASConsumer, IPGeolocationCSVConsumer
+from metranova.utils.ip_trie import IPTrie
 
 class TestYAMLFileConsumer(unittest.TestCase):
     def setUp(self):
@@ -762,10 +762,10 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
         self.assertIsNone(result)
 
     @patch('builtins.open', new_callable=mock_open)
-    @patch('pytricia.PyTricia')
+    @patch('metranova.consumers.metadata.IPTrie')
     def test_load_asn_data_success(self, mock_pytricia, mock_file):
         """Test _load_asn_data with successful file processing."""
-        # Mock PyTricia instance
+        # Mock IPTrie instance
         mock_trie = Mock()
         mock_trie.__setitem__ = Mock()
         mock_pytricia.return_value = mock_trie
@@ -786,8 +786,8 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
         
         result = self.consumer._load_asn_data()
         
-        # Verify PyTricia was initialized correctly
-        mock_pytricia.assert_called_once_with(128)
+        # Verify the family-safe trie was created
+        mock_pytricia.assert_called_once_with()
         self.assertEqual(result, mock_trie)
         
         # Verify that data was added to trie
@@ -798,7 +798,7 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
         self.assertEqual(mock_file.call_count, 2)
 
     @patch('builtins.open', new_callable=mock_open)
-    @patch('pytricia.PyTricia')
+    @patch('metranova.consumers.metadata.IPTrie')
     def test_load_asn_data_file_not_found(self, mock_pytricia, mock_file):
         """Test _load_asn_data handles file not found errors."""
         mock_trie = Mock()
@@ -814,7 +814,7 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
         self.assertEqual(result, mock_trie)
 
     @patch('builtins.open', new_callable=mock_open)
-    @patch('pytricia.PyTricia')
+    @patch('metranova.consumers.metadata.IPTrie')
     def test_load_asn_data_processing_error(self, mock_pytricia, mock_file):
         """Test _load_asn_data handles CSV processing errors."""
         mock_trie = Mock()
@@ -1072,9 +1072,16 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
         # Verify custom data was updated (entry should be removed)
         self.assertNotIn('192.168.1.0/24', remaining_custom)
         
-        # Verify networks were tracked
+        # Verify networks were tracked, each with its geo fields (in
+        # INHERITED_GEO_FIELDS order) for ASN blocks inside it to inherit
         self.assertIn('192.168.1.0/24', processed_networks)
         self.assertIn('10.0.0.0/8', processed_networks)
+        self.assertEqual(len(processed_networks), 2)
+        geo = dict(zip(self.consumer.INHERITED_GEO_FIELDS, processed_networks.get('10.0.0.0/8')))
+        self.assertEqual(geo['city_name'], 'Paris')
+        self.assertEqual(geo['latitude'], '48.8566')
+        self.assertEqual(geo['longitude'], '2.3522')
+        self.assertIsNone(geo['country_name'])
 
     @patch('builtins.open', new_callable=mock_open)
     def test_process_ip_block_files_file_error(self, mock_file):
@@ -1105,43 +1112,238 @@ class TestIPGeolocationCSVConsumer(unittest.TestCase):
         self.assertEqual(self.mock_pipeline.process_message.call_count, 1)
         self.assertEqual(len(processed_networks), 1)
 
+    def _city_blocks(self, blocks):
+        """Build the city_blocks trie _process_ip_block_files() returns:
+        network -> tuple of geo fields in INHERITED_GEO_FIELDS order."""
+        trie = IPTrie()
+        for network, geo in blocks.items():
+            trie[network] = tuple(geo.get(field) for field in self.consumer.INHERITED_GEO_FIELDS)
+        return trie
+
     @patch('builtins.open', new_callable=mock_open)
-    def test_process_remaining_asn_ranges_skips_range_contained_in_city_block(self, mock_file):
-        """An ASN-only range that sits entirely inside a broader City block
-        (e.g. 128.182.64.0/18 inside 128.182.0.0/16) must be skipped even
-        though its own CIDR string never appears in processed_networks --
-        processed_networks is a pytricia trie, so this is a real
-        subnet-containment check, not an exact string match. Otherwise this
-        narrower, location-less row would get added and win any later
-        IP_TRIE lookup over the broader, complete City-block row."""
-        asn_csv = "network,autonomous_system_number\n128.182.64.0/18,12345"
+    def test_process_remaining_asn_ranges_inherits_geo_from_containing_city_block(self, mock_file):
+        """An ASN block narrower than the City block containing it
+        (128.182.64.0/18 inside 128.182.0.0/16) is the most specific row for
+        its addresses, so it must be emitted with both its ASN and the City
+        block's geo fields. Without the geo fields, lookups in that range
+        return a blank country; without the row at all, they return no ASN."""
+        asn_csv = "network,autonomous_system_number\n128.182.64.0/18,1207"
         mock_file.return_value = StringIO(asn_csv)
         self.consumer.asn_files = ['/test/asn1.csv']
 
-        processed_networks = pytricia.PyTricia(128)
-        processed_networks['128.182.0.0/16'] = True  # broader City block
+        city_blocks = self._city_blocks({'128.182.0.0/16': {
+            'country_name': 'United States', 'country_code': 'US', 'continent_name': 'North America',
+            'country_sub_name': '', 'country_sub_code': '', 'city_name': '',
+            'latitude': '37.7510', 'longitude': '-97.8220',
+        }})
 
-        self.consumer._process_remaining_asn_ranges(processed_networks, {}, {})
+        with patch.object(self.consumer.logger, 'info') as mock_info:
+            self.consumer._process_remaining_asn_ranges(city_blocks, {}, {})
+
+        self.mock_pipeline.process_message.assert_called_once()
+        message = self.mock_pipeline.process_message.call_args[0][0]
+        self.assertEqual(message['table'], self.consumer.table)
+        ip_obj = message['data'][0]
+        self.assertEqual(ip_obj, {
+            'id': '128.182.64.0/18',
+            'ip_subnet': [('128.182.64.0', 18)],
+            'as_id': 1207,
+            'country_name': 'United States', 'country_code': 'US', 'continent_name': 'North America',
+            'country_sub_name': '', 'country_sub_code': '', 'city_name': '',
+            'latitude': '37.7510', 'longitude': '-97.8220',
+        })
+        summary = mock_info.call_args[0][0]
+        self.assertIn('added 0 with no City block', summary)
+        self.assertIn('added 1 narrower than their City block', summary)
+        self.assertIn('skipped 0 identical', summary)
+
+    @patch('builtins.open', new_callable=mock_open)
+    def test_process_remaining_asn_ranges_skips_range_identical_to_city_block(self, mock_file):
+        """An ASN block that is exactly a City block is not emitted again:
+        that City row already carries the ASN."""
+        asn_csv = "network,autonomous_system_number\n128.182.0.0/16,1206"
+        mock_file.return_value = StringIO(asn_csv)
+        self.consumer.asn_files = ['/test/asn1.csv']
+
+        city_blocks = self._city_blocks({'128.182.0.0/16': {'country_name': 'United States'}})
+
+        self.consumer._process_remaining_asn_ranges(city_blocks, {}, {})
 
         self.mock_pipeline.process_message.assert_not_called()
 
     @patch('builtins.open', new_callable=mock_open)
     def test_process_remaining_asn_ranges_adds_range_not_covered_by_city_block(self, mock_file):
-        """An ASN-only range with no covering City block at all (broader,
-        narrower, or otherwise) must still be added."""
-        asn_csv = "network,autonomous_system_number\n169.228.0.0/17,8517"
+        """An ASN block with no City block containing it is added with its
+        ASN only -- including one that is broader than the City blocks inside
+        it, which must not pick up their geo fields."""
+        asn_csv = "network,autonomous_system_number\n169.228.0.0/17,8517\n10.0.0.0/8,65002"
         mock_file.return_value = StringIO(asn_csv)
         self.consumer.asn_files = ['/test/asn1.csv']
 
-        processed_networks = pytricia.PyTricia(128)
-        processed_networks['10.0.0.0/8'] = True  # unrelated City block
+        city_blocks = self._city_blocks({
+            '10.1.0.0/16': {'country_name': 'France', 'city_name': 'Paris'},  # inside the 10.0.0.0/8 ASN block
+            '192.168.0.0/16': {'country_name': 'Germany'},                    # unrelated
+        })
 
-        self.consumer._process_remaining_asn_ranges(processed_networks, {}, {})
+        self.consumer._process_remaining_asn_ranges(city_blocks, {}, {})
 
-        self.mock_pipeline.process_message.assert_called_once()
-        call_data = self.mock_pipeline.process_message.call_args[0][0]['data'][0]
-        self.assertEqual(call_data['id'], '169.228.0.0/17')
-        self.assertEqual(call_data['as_id'], 8517)
+        emitted = [c[0][0]['data'][0] for c in self.mock_pipeline.process_message.call_args_list]
+        self.assertEqual(emitted, [
+            {'id': '169.228.0.0/17', 'ip_subnet': [('169.228.0.0', 17)], 'as_id': 8517},
+            {'id': '10.0.0.0/8', 'ip_subnet': [('10.0.0.0', 8)], 'as_id': 65002},
+        ])
+
+    @patch('builtins.open', new_callable=mock_open)
+    def test_process_remaining_asn_ranges_custom_data_overrides_inherited_geo(self, mock_file):
+        """Custom data for the ASN block itself wins over inherited geo fields
+        and is consumed from custom_ip_data."""
+        asn_csv = "network,autonomous_system_number\n128.182.64.0/18,1207"
+        mock_file.return_value = StringIO(asn_csv)
+        self.consumer.asn_files = ['/test/asn1.csv']
+
+        city_blocks = self._city_blocks({'128.182.0.0/16': {'country_name': 'United States', 'city_name': ''}})
+        custom_data = {'128.182.64.0/18': {'city_name': 'Pittsburgh'}, '203.0.113.0/24': {'city_name': 'Elsewhere'}}
+
+        remaining = self.consumer._process_remaining_asn_ranges(city_blocks, {}, custom_data)
+
+        ip_obj = self.mock_pipeline.process_message.call_args[0][0]['data'][0]
+        self.assertEqual(ip_obj['city_name'], 'Pittsburgh')
+        self.assertEqual(ip_obj['country_name'], 'United States')
+        self.assertEqual(ip_obj['as_id'], 1207)
+        self.assertEqual(remaining, {'203.0.113.0/24': {'city_name': 'Elsewhere'}})
+
+    @patch('builtins.open', new_callable=mock_open)
+    def test_process_remaining_asn_ranges_ignores_city_block_of_other_family(self, mock_file):
+        """IPv4 and IPv6 blocks that merely start with the same bytes are
+        unrelated: 2600:1f00::/24 (0x26 0x00 0x1f) is not inside the IPv4 City
+        block 38.0.16.0/20 (0x26 0x00 0x1), and 38.0.31.0/24 is not the IPv6
+        City block 2600:1f00::/24."""
+        asn_csv = "network,autonomous_system_number\n2600:1f00::/24,16509\n38.0.31.0/24,174"
+        mock_file.return_value = StringIO(asn_csv)
+        self.consumer.asn_files = ['/test/asn1.csv']
+
+        city_blocks = self._city_blocks({
+            '38.0.16.0/20': {'country_name': 'United States', 'city_name': 'Washington'},
+            '2600:1f00::/24': {'country_name': 'Ireland', 'city_name': 'Dublin'},
+        })
+
+        self.consumer._process_remaining_asn_ranges(city_blocks, {}, {})
+
+        emitted = [c[0][0]['data'][0] for c in self.mock_pipeline.process_message.call_args_list]
+        # the IPv6 ASN block is identical to the IPv6 City block -> skipped;
+        # the IPv4 ASN block sits inside the IPv4 City block -> its geo fields
+        self.assertEqual(emitted, [{
+            'id': '38.0.31.0/24', 'ip_subnet': [('38.0.31.0', 24)], 'as_id': 174,
+            'country_name': 'United States', 'city_name': 'Washington',
+        }])
+
+    @patch('builtins.open', new_callable=mock_open)
+    def test_load_asn_data_keeps_ipv4_and_ipv6_apart(self, mock_file):
+        """An IPv6 City block with no IPv6 ASN entry must not pick up the ASN
+        of an IPv4 block that starts with the same bytes (32.1.0.0/18 vs
+        2001:208::/32), and the reverse."""
+        asn_csv = "network,autonomous_system_number\n32.1.0.0/18,7018\n2600::/12,65010"
+        mock_file.return_value = StringIO(asn_csv)
+        self.consumer.asn_files = ['/test/asn1.csv']
+
+        ip_to_asn_trie = self.consumer._load_asn_data()
+
+        self.assertIsNone(ip_to_asn_trie.get('2001:208::/32'))
+        self.assertIsNone(ip_to_asn_trie.get('38.1.2.0/24'))
+        self.assertEqual(ip_to_asn_trie.get('32.1.2.0/24'), 7018)
+        self.assertEqual(ip_to_asn_trie.get('2600:1f00::/24'), 65010)
+
+    def test_consume_messages_lookups_return_geo_and_asn_together(self):
+        """End to end over City, ASN and location files whose blocks don't line
+        up: a longest-prefix lookup over the emitted rows must return, for any
+        address, both what the City file says and what the ASN file says."""
+        files = {
+            '/test/locations.csv': (
+                "geoname_id,locale_code,continent_code,continent_name,country_iso_code,country_name,"
+                "subdivision_1_iso_code,subdivision_1_name,subdivision_2_iso_code,subdivision_2_name,"
+                "city_name,metro_code,time_zone,is_in_european_union\n"
+                "1,en,NA,North America,US,United States,,,,,,,America/Chicago,0\n"
+                "2,en,NA,North America,US,United States,PA,Pennsylvania,,,Pittsburgh,508,America/New_York,0\n"
+                "3,en,AS,Asia,KR,South Korea,11,Seoul,,,Seoul,,Asia/Seoul,0\n"
+                "4,en,EU,Europe,NL,The Netherlands,,,,,,,Europe/Amsterdam,1\n"
+                "5,en,EU,Europe,IE,Ireland,L,Leinster,,,Dublin,,Europe/Dublin,1\n"
+            ),
+            '/test/city4.csv': (
+                "network,geoname_id,registered_country_geoname_id,represented_country_geoname_id,"
+                "is_anonymous_proxy,is_satellite_provider,postal_code,latitude,longitude,accuracy_radius,is_anycast\n"
+                "128.182.0.0/17,1,1,,0,0,,37.7510,-97.8220,1000,0\n"      # ASN blocks are narrower (/18s)
+                "128.182.160.0/19,2,1,,0,0,15212,40.4422,-79.9927,20,0\n"  # ASN block is broader (/17)
+                "165.132.0.0/19,3,3,,0,0,04524,37.5658,126.9780,20,0\n"    # ASN block is narrower (/21)
+                "192.16.200.0/23,4,4,,0,0,,52.3824,4.8995,100,0\n"         # ASN block is narrower (/24)
+                "198.51.100.0/24,1,1,,0,0,,37.7510,-97.8220,1000,0\n"      # ASN block is identical
+                "203.0.113.0/24,1,1,,0,0,,37.7510,-97.8220,1000,0\n"       # no ASN block at all
+            ),
+            '/test/city6.csv': (
+                "network,geoname_id,registered_country_geoname_id,represented_country_geoname_id,"
+                "is_anonymous_proxy,is_satellite_provider,postal_code,latitude,longitude,accuracy_radius,is_anycast\n"
+                "2001:208::/32,4,4,,0,0,,52.3824,4.8995,100,0\n"           # no IPv6 ASN block; 32.1.0.0/18 shares its leading bytes
+                "2600:1f00::/24,5,5,,0,0,,53.3331,-6.2489,50,0\n"          # ASN block is narrower (/32)
+            ),
+            '/test/asn4.csv': (
+                "network,autonomous_system_number,autonomous_system_organization\n"
+                "128.182.0.0/18,1206,Pittsburgh Supercomputing Center\n"
+                "128.182.64.0/18,1207,Pittsburgh Supercomputing Center\n"
+                "128.182.128.0/17,1206,Pittsburgh Supercomputing Center\n"
+                "165.132.24.0/21,4665,Yonsei University\n"
+                "192.16.200.0/24,1101,SURF B.V.\n"
+                "198.51.100.0/24,64500,Identical Block\n"
+                "169.228.0.0/17,8517,No City Block\n"
+                "32.1.0.0/18,7018,ATT\n"
+            ),
+            '/test/asn6.csv': (
+                "network,autonomous_system_number,autonomous_system_organization\n"
+                "2600:1f00::/32,16509,Amazon\n"
+            ),
+        }
+        self.consumer.location_files = ['/test/locations.csv']
+        self.consumer.ip_block_files = ['/test/city4.csv', '/test/city6.csv']
+        self.consumer.asn_files = ['/test/asn4.csv', '/test/asn6.csv']
+        self.consumer.custom_ip_file = None
+
+        with patch('builtins.open', side_effect=lambda name, mode='r': StringIO(files[name])):
+            self.consumer.consume_messages()
+
+        # What a longest-prefix lookup over meta_ip returns: one whole row
+        rows = IPTrie()
+        ids = []
+        for call in self.mock_pipeline.process_message.call_args_list:
+            for ip_obj in call[0][0]['data']:
+                ids.append(ip_obj['id'])
+                rows[ip_obj['id']] = ip_obj
+        self.assertEqual(len(ids), len(set(ids)), "a network was emitted more than once")
+
+        def lookup(ip):
+            row = rows.get(ip)
+            return (row['id'], row.get('country_name'), row.get('city_name'), row.get('as_id'), row.get('latitude'))
+
+        # ASN blocks narrower than the City block: own row, City block's geo
+        self.assertEqual(lookup('128.182.64.1'), ('128.182.64.0/18', 'United States', '', 1207, '37.7510'))
+        self.assertEqual(lookup('128.182.1.1'), ('128.182.0.0/18', 'United States', '', 1206, '37.7510'))
+        self.assertEqual(lookup('165.132.24.1'), ('165.132.24.0/21', 'South Korea', 'Seoul', 4665, '37.5658'))
+        self.assertEqual(lookup('192.16.200.1'), ('192.16.200.0/24', 'The Netherlands', '', 1101, '52.3824'))
+        self.assertEqual(lookup('2600:1f00::1'), ('2600:1f00::/32', 'Ireland', 'Dublin', 16509, '53.3331'))
+        # ...and the rest of those City blocks, outside any ASN block: geo, no ASN
+        self.assertEqual(lookup('165.132.1.1'), ('165.132.0.0/19', 'South Korea', 'Seoul', None, '37.5658'))
+        self.assertEqual(lookup('192.16.201.1'), ('192.16.200.0/23', 'The Netherlands', '', None, '52.3824'))
+        self.assertEqual(lookup('2600:1f80::1'), ('2600:1f00::/24', 'Ireland', 'Dublin', None, '53.3331'))
+        # ASN block broader than the City block: City row carries the ASN...
+        self.assertEqual(lookup('128.182.160.1'), ('128.182.160.0/19', 'United States', 'Pittsburgh', 1206, '40.4422'))
+        # ...and the rest of the ASN block has the ASN and no geo
+        self.assertEqual(lookup('128.182.200.1'), ('128.182.128.0/17', None, None, 1206, None))
+        # identical blocks: one row with both
+        self.assertEqual(lookup('198.51.100.1'), ('198.51.100.0/24', 'United States', '', 64500, '37.7510'))
+        # only in one of the two files
+        self.assertEqual(lookup('203.0.113.1'), ('203.0.113.0/24', 'United States', '', None, '37.7510'))
+        self.assertEqual(lookup('169.228.1.1'), ('169.228.0.0/17', None, None, 8517, None))
+        # IPv6 City block with no IPv6 ASN entry does not get the ASN of the
+        # IPv4 block that shares its leading bytes (32.1.0.0/18 -> AS7018)
+        self.assertEqual(lookup('2001:208::1'), ('2001:208::/32', 'The Netherlands', '', None, '52.3824'))
+        self.assertEqual(lookup('32.1.2.3'), ('32.1.0.0/18', None, None, 7018, None))
 
     @patch.object(IPGeolocationCSVConsumer, '_process_remaining_asn_ranges')
     @patch.object(IPGeolocationCSVConsumer, '_process_ip_block_files')
