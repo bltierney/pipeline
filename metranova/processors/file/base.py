@@ -59,6 +59,17 @@ class IPTriePickleFileProcessor(BaseFileProcessor):
                 if address.startswith('::ffff:'):
                     # Convert IPv4-mapped IPv6 address to IPv4
                     address = address.split('::ffff:')[1]
+                    # ip_subnet columns that back an IP_TRIE() dictionary (meta_ip,
+                    # scireg, community) store an IPv4 prefix length offset by 96, see
+                    # trie_prefix_length() in processors/clickhouse/base.py. Undo that
+                    # along with the address: pytricia does not reject an IPv4 prefix
+                    # longer than 32, it stores it as a /32, which would turn every IPv4
+                    # block into a single-host entry that matches nothing else inside it.
+                    if isinstance(prefix, int) and prefix >= 96:
+                        prefix -= 96
+                    elif isinstance(prefix, int) and prefix > 32:
+                        self.logger.warning(f"Invalid prefix length for IPv4 subnet: {ip_subnet_tuple}")
+                        continue
                 #Clickhouse makes IPv4 addresses look like IPv6 so convert back
                 ip_trie["{}/{}".format(address, prefix)] = lookup_value
 
